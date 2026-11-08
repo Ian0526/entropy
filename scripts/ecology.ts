@@ -3,7 +3,11 @@
  * stability. Usage: npx tsx scripts/ecology.ts [ticks=9000] [runs=3] [size=256]
  */
 import { QuantumEntropyEngine } from '../src/engine/QuantumEntropy';
-import { SimulationCore } from '../src/engine/SimulationCore';
+import { ECO, SimulationCore } from '../src/engine/SimulationCore';
+
+// Override tunables from the environment, e.g. ECO='{"drift":0.3,"baseFood":0.2}'
+if (process.env.ECO) Object.assign(ECO, JSON.parse(process.env.ECO));
+console.log('ECO', JSON.stringify(ECO));
 
 const TICKS = Number(process.argv[2] ?? 9000);
 const RUNS = Number(process.argv[3] ?? 3);

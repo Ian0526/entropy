@@ -45,6 +45,19 @@ const ATTACK_COST = 0.001;
 const PREDATION_EFFICIENCY = 0.75;
 const BODY_MASS_RETURN = 0.15; //    structural mass returned to food on death
 const FOOD_BASE_REGEN = 0.013;
+/** Ecology tunables (exported so the headless probe in scripts/ecology.ts can sweep them). */
+export const ECO = {
+  /** Fraction of the regrowth rate that applies everywhere, so open space is never fully barren. */
+  baseFood: 0.05,
+  /** Food lost per tick outside of regrowth. */
+  evaporation: 0.0025,
+  /** Multiplier on how fast the nutrient pockets drift. */
+  drift: 0.2,
+  /** Maintenance multiplier for starving cells (dormancy). */
+  starvingDecay: 0.85,
+  /** A cell only divides if its tile holds at least this much food (0 = off). */
+  divideFoodMin: 0,
+};
 const NOISE_CELL = 8; //             coarse food-noise lattice spacing (cells)
 const SIGNAL_A_DECAY = 0.9; //       per tick
 const SIGNAL_B_DECAY = 0.86;
@@ -228,10 +241,10 @@ export class SimulationCore {
     // Quantum symmetry breaking: drift directions of the two nutrient pocket fields.
     const a1 = q.nextFloat() * Math.PI * 2;
     const a2 = a1 + Math.PI * (0.5 + q.nextFloat());
-    this.driftAx = Math.cos(a1) * 0.0008;
-    this.driftAy = Math.sin(a1) * 0.0008;
-    this.driftBx = Math.cos(a2) * 0.0013;
-    this.driftBy = Math.sin(a2) * 0.0013;
+    this.driftAx = Math.cos(a1) * 0.0008 * ECO.drift;
+    this.driftAy = Math.sin(a1) * 0.0008 * ECO.drift;
+    this.driftBx = Math.cos(a2) * 0.0013 * ECO.drift;
+    this.driftBy = Math.sin(a2) * 0.0013 * ECO.drift;
     this.updatePockets();
     for (let i = 0; i < this.N; i++) this.food[i] = Math.min(1, this.pocket[i] * 0.9 + 0.05);
 
@@ -388,7 +401,7 @@ export class SimulationCore {
       }
       const f = food[i];
       // Logistic regrowth inside pockets, slow evaporation outside them.
-      food[i] = f + regen * pocket[i] * (1 - f) - f * 0.0025;
+      food[i] = f + regen * (ECO.baseFood + (1 - ECO.baseFood) * pocket[i]) * (1 - f) - f * ECO.evaporation;
     }
   }
 
@@ -535,7 +548,7 @@ export class SimulationCore {
       const damaged = (ep & EPI_DAMAGED) !== 0;
 
       // -- 1. maintenance: entropic bleed (always, independent of the phase clock)
-      let e = energy[i] - DECAY[t] * decayMul * (starving ? 0.85 : 1);
+      let e = energy[i] - DECAY[t] * decayMul * (starving ? ECO.starvingDecay : 1);
 
       // -- Poisson phase clock: does this cell act during this tick?
       if (q.nextFloat() < phaseP) {
@@ -592,7 +605,7 @@ export class SimulationCore {
         let divided = false;
         const cf = chemoFood(w0) * (starving ? 1.6 : 1);
         const cs = chemoSignal(w0);
-        if (e > divideThreshold(w0) + REPLICATION_COST) {
+        if (e > divideThreshold(w0) + REPLICATION_COST && food[i] >= ECO.divideFoodMin) {
           let best = -1;
           let bestScore = -1e9;
           for (let d = 0; d < 4; d++) {

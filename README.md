@@ -34,6 +34,7 @@ npm run build && npm start   # production: http://localhost:8080
 * **Metabolic routing:** Jacobi-style pairwise pumping between kin cells. It moves energy from high E to low E and toward alarm signals, conserves energy exactly, and caps outflow at 20% of the donor so no energy goes negative.
 * **Healing and foraging:** division targets are scored by food and signal gradients and by how many kin neighbours the target has, so wounds fill in. Alarm signals and damage memory push newborn cells toward armor. Cilia cells crawl up food gradients while staying attached to kin.
 * **Predation:** aggression drains energy from foreign neighbours. Armor resists. Damage sets the epigenetic bit, which children inherit.
+* **Food field (the green glow):** two quantum-seeded simplex noise fields drift slowly in different directions, forming nutrient pockets where food regrows logistically; 5% of the regrowth applies everywhere, so open space is lean but never barren. Pockets drift at a pace colonies can follow, which keeps populations stable (no boom-and-bust). Tunables live in `ECO` in `SimulationCore.ts`; measure changes with `npm run ecology`.
 * **Abiogenesis:** if the population collapses, a quantum event seeds new founder colonies.
 
 ## Wire format
