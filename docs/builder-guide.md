@@ -36,4 +36,5 @@ Run them yourself before finishing.
 - Match the style of the file you're in. Keep the hot paths (engine, renderer) allocation-free.
 - Conserve energy in the simulation unless the owner asks otherwise; the README documents the physics, so keep it current when you change behaviour.
 - Never touch secrets, `.env` files, `railway.json`, the Dockerfile's runtime user, or deployment settings unless the owner explicitly asks.
+- Never kill processes by name (`taskkill /IM node.exe`, `killall node`, `Stop-Process -Name node`): the Builder worker that runs you is a node process, and killing it ends your request. If you start a server to test something, use a free port (e.g. 8100+), keep its PID, and stop only that PID (`kill <pid>`).
 - The site is password-protected (`SITE_PASSWORD`). Don't weaken the gate in `src/server/builder/auth.ts`.

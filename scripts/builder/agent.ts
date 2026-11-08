@@ -19,6 +19,9 @@ const DENIED = [
   'Bash(git push*)', 'Bash(git commit*)', 'Bash(git remote*)', 'Bash(railway*)', 'Bash(curl*)', 'Bash(wget*)', 'WebFetch', 'WebSearch',
   'Read(**/.env*)', 'Edit(**/.env*)', 'Write(**/.env*)', 'Edit(.claude/**)', 'Write(.claude/**)', 'Edit(.mcp.json)', 'Write(.mcp.json)',
   'Read(**/.credentials.json)', 'Edit(railway.json)', 'Write(railway.json)', 'Edit(.github/**)', 'Write(.github/**)',
+  // Killing processes by name takes down the worker itself (it is a node process too).
+  'Bash(taskkill*)', 'Bash(killall*)', 'Bash(pkill*)', 'Bash(Stop-Process*)', 'Bash(powershell*Stop-Process*)',
+  'PowerShell(Stop-Process*)', 'PowerShell(taskkill*)', 'PowerShell(*Stop-Process*)', 'PowerShell(*taskkill*)',
 ];
 
 /** Lifted by --dangerously-skip-permissions, which stops the allow list applying but keeps the rest of the deny list. */
