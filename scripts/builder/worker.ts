@@ -316,8 +316,17 @@ async function main() {
     return report(job.id, { action: 'merged' });
   }
 
-  const reset = await site('reset', {});
-  if (reset?.failed) log(`Marked ${reset.failed} interrupted request(s) as failed.`);
+  // The site may be down or mid-deploy (an approved change redeploys it), so wait for it.
+  for (let waited = false; ; waited = true) {
+    try {
+      const reset = await site('reset', {});
+      if (reset?.failed) log(`Marked ${reset.failed} interrupted request(s) as failed.`);
+      break;
+    } catch (err) {
+      if (!waited) log(`Waiting for ${baseUrl}: ${err instanceof Error ? err.message : err}`);
+      await new Promise((r) => setTimeout(r, 15_000));
+    }
+  }
   log(`Ready. ${baseUrl} → ${model} on your Claude plan, up to about $${maxUsd} of usage a request. Pushes go to ${main}.`);
 
   for (;;) {

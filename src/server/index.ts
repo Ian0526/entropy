@@ -45,7 +45,7 @@ function clampInt(v: string | undefined, lo: number, hi: number, d: number): num
 }
 
 // trustProxy: Railway's edge sets X-Forwarded-For/Proto (used for the unlock rate limit and Secure cookies).
-const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, bodyLimit: 16 * 1024, trustProxy: true });
+const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, bodyLimit: 16 * 1024, trustProxy: true, disableRequestLogging: true });
 const log = (m: string) => app.log.info(m);
 
 // ---- quantum entropy (shared with the worker) -------------------------------------
