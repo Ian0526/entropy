@@ -343,7 +343,9 @@ export class SimulationCore {
     const [a0, a1w] = makeAncestor(q.nextUint32() & 0xffff);
     this.ancestor[0] = a0;
     this.ancestor[1] = a1w;
-    this.seedFounders(this.D > 1 ? ECO.founders3d : 10);
+    // Founder count scales with the world's size (10 per 256², ECO.founders3d per 64³) so big worlds fill as fast as small ones.
+    const scale = this.D > 1 ? this.N / (64 * 64 * 64) : this.N / (256 * 256);
+    this.seedFounders(Math.max(4, Math.round((this.D > 1 ? ECO.founders3d : 10) * scale)));
     this.stats = this.emptyStats();
     this.refreshStats();
     this.collectSpecies();

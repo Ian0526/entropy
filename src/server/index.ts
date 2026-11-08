@@ -33,10 +33,10 @@ if (existsSync('.env')) process.loadEnvFile('.env');
 
 const PORT = Number(process.env.PORT ?? 8080);
 const HOST = process.env.HOST ?? '0.0.0.0';
-const GRID_W = clampInt(process.env.GRID_W, 64, 1024, 256);
-const GRID_H = clampInt(process.env.GRID_H, 64, 1024, 256);
+const GRID_W = clampInt(process.env.GRID_W, 64, 1024, 512);
+const GRID_H = clampInt(process.env.GRID_H, 64, 1024, 512);
 /** Edge length of the cubic 3D world (cells). 0 disables it. */
-const GRID_3D = process.env.GRID_3D === '0' ? 0 : clampInt(process.env.GRID_3D, 16, 128, 64);
+const GRID_3D = process.env.GRID_3D === '0' ? 0 : clampInt(process.env.GRID_3D, 16, 128, 72);
 const INTERVAL_ENV = process.env.QRNG_INTERVAL_MS ?? process.env.ANU_INTERVAL_MS;
 const QRNG_INTERVAL_MS = INTERVAL_ENV ? clampInt(INTERVAL_ENV, 10_000, 90 * 24 * 3600_000, 60_000) : undefined;
 const QRNG_MONTHLY = process.env.QRNG_MONTHLY_REQUESTS ? clampInt(process.env.QRNG_MONTHLY_REQUESTS, 1, 10_000_000, 10) : undefined;
