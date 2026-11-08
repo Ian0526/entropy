@@ -1,9 +1,9 @@
 /**
- * Builder: suggest a change or ask a question in plain words. A coding agent on the owner's PC works
- * on it; code changes wait here for approval, and approving pushes them, which deploys them.
+ * Builder chat: suggest a change or ask a question in plain words. A coding agent on the owner's PC
+ * works on it; code changes wait here for approval, and approving pushes them, which deploys them.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowLeft, Check, ImagePlus, Loader2, MessageSquareText, Plus, Send, Square } from 'lucide-react';
+import { ArrowLeft, Check, ImagePlus, Loader2, MessageSquareText, Plus, Send, Square, X } from 'lucide-react';
 import type { BuilderImage, RequestStatus, RequestSummary } from '../../server/builder/types';
 
 const POLL_MS = 3000;
@@ -152,7 +152,7 @@ function Thread({ r, onChange }: { r: RequestSummary; onChange: () => void }) {
               {r.proposal.files.map((f) => <li key={f}>{f}</li>)}
             </ul>
             {r.shotCount > 0 && (
-              <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              <div className="mt-3 grid gap-2">
                 {Array.from({ length: r.shotCount }, (_, n) => (
                   <a key={n} href={`/api/builder/${r.id}/shots/${n}?v=${r.updatedAt}`} target="_blank" rel="noreferrer">
                     <img src={`/api/builder/${r.id}/shots/${n}?v=${r.updatedAt}`} alt={`Screenshot ${n + 1}`} className="w-full rounded-lg border border-slate-800" />
@@ -189,15 +189,23 @@ function Thread({ r, onChange }: { r: RequestSummary; onChange: () => void }) {
   );
 }
 
-export function BuilderPage() {
+/**
+ * Builder as a chat window over the simulation: a floating panel on desktop, a full-screen
+ * sheet on phones. Three views in one column: the request list, one conversation, a new request.
+ * It only polls the server while open.
+ */
+export function BuilderChat({ onClose }: { onClose: () => void }) {
   const [data, setData] = useState<Overview | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(() => new URLSearchParams(window.location.search).get('r'));
+  const [locked, setLocked] = useState(false);
+  /** null = the request list, 'new' = composing, otherwise a request id. */
+  const [view, setView] = useState<string | null>(null);
+  const firstLoad = useRef(true);
 
   const load = useCallback(async () => {
     const res = await fetch('/api/builder');
     if (res.status === 401) {
-      window.location.replace(`/unlock?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+      setLocked(true);
       return;
     }
     const json = (await res.json().catch(() => ({}))) as Overview & { error?: string };
@@ -205,6 +213,8 @@ export function BuilderPage() {
     else {
       setError(null);
       setData(json);
+      if (firstLoad.current && json.requests.length === 0) setView('new');
+      firstLoad.current = false;
     }
   }, []);
 
@@ -214,98 +224,94 @@ export function BuilderPage() {
     return () => clearInterval(t);
   }, [load]);
 
-  const select = (id: string | null) => {
-    setSelected(id);
-    const url = new URL(window.location.href);
-    if (id) url.searchParams.set('r', id);
-    else url.searchParams.delete('r');
-    window.history.replaceState(null, '', url);
-  };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
-  const current = data?.requests.find((r) => r.id === selected) ?? null;
+  const current = view && view !== 'new' ? data?.requests.find((r) => r.id === view) ?? null : null;
+  const title = view === 'new' ? 'New request' : current ? current.title : 'Builder';
 
   return (
-    <div className="flex h-full flex-col bg-[#02040b] text-slate-200 select-text" style={{ paddingTop: 'env(safe-area-inset-top)' }}>
-      <header className="flex shrink-0 items-center gap-3 border-b border-slate-800 px-4 py-3">
-        <a href="/" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white" title="Back to the simulation">
-          <ArrowLeft size={18} />
-        </a>
-        <MessageSquareText size={18} className="text-emerald-300" />
-        <h1 className="text-base font-semibold text-slate-100">Builder</h1>
-        {data && (
-          <div className="ml-auto flex items-center gap-3 text-xs text-slate-400">
-            <span className="hidden sm:inline">${data.spentUsd.toFixed(2)} of ${data.dailyLimitUsd} today</span>
-            <span className="flex items-center gap-1.5">
-              <span className={`h-2 w-2 rounded-full ${data.workerOnline ? 'bg-emerald-400' : 'bg-slate-600'}`} />
-              {data.workerOnline ? 'PC online' : 'PC offline'}
-            </span>
-          </div>
+    <div
+      className="pointer-events-auto fixed inset-0 z-50 flex flex-col bg-[#02040b] text-slate-200 select-text lg:inset-auto lg:bottom-24 lg:right-4 lg:top-4 lg:w-[420px] lg:rounded-2xl lg:border lg:border-slate-800 lg:bg-slate-950/95 lg:shadow-2xl lg:shadow-black/60 lg:backdrop-blur-md"
+      style={{ paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }}
+      role="dialog"
+      aria-label="Builder chat"
+    >
+      <header className="flex shrink-0 items-center gap-2 border-b border-slate-800 px-3 py-2.5">
+        {view !== null ? (
+          <button type="button" onClick={() => setView(null)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white" aria-label="All requests">
+            <ArrowLeft size={16} />
+          </button>
+        ) : (
+          <MessageSquareText size={16} className="ml-1.5 text-emerald-300" />
         )}
+        <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-100">{title}</h2>
+        {current && <Badge status={current.status} />}
+        {data && !current && (
+          <span className="flex items-center gap-1.5 text-[11px] text-slate-400" title={`$${data.spentUsd.toFixed(2)} of $${data.dailyLimitUsd} used today`}>
+            <span className={`h-2 w-2 rounded-full ${data.workerOnline ? 'bg-emerald-400' : 'bg-slate-600'}`} />
+            {data.workerOnline ? 'PC online' : 'PC offline'}
+          </span>
+        )}
+        <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white" aria-label="Close Builder">
+          <X size={16} />
+        </button>
       </header>
 
-      {error && <p role="alert" className="mx-4 mt-3 rounded-xl border border-rose-900 bg-rose-950/40 p-3 text-sm text-rose-200">{error}</p>}
+      {locked && (
+        <p className="m-3 rounded-xl border border-slate-700 p-3 text-sm text-slate-300">
+          Your session expired. <a className="text-emerald-300 underline" href="/unlock?next=%2F%3Fbuilder%3D1">Unlock again</a>.
+        </p>
+      )}
+      {error && <p role="alert" className="m-3 rounded-xl border border-rose-900 bg-rose-950/40 p-3 text-sm text-rose-200">{error}</p>}
 
-      <div className="flex min-h-0 flex-1">
-        <aside className={`${current ? 'hidden md:flex' : 'flex'} w-full shrink-0 flex-col border-slate-800 md:w-80 md:border-r`}>
-          <div className="p-3">
-            <button type="button" onClick={() => select(null)} className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:border-emerald-600 hover:text-emerald-200">
+      <div className="flex min-h-0 flex-1 flex-col p-3">
+        {view === null && (
+          <>
+            <button type="button" onClick={() => setView('new')} className="mb-2 flex w-full shrink-0 items-center justify-center gap-1.5 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:border-emerald-600 hover:text-emerald-200">
               <Plus size={15} /> New request
             </button>
-          </div>
-          <div className="tl-scroll min-h-0 flex-1 overflow-y-auto px-2 pb-3">
-            {data?.requests.map((r) => (
-              <button
-                key={r.id}
-                type="button"
-                onClick={() => select(r.id)}
-                className={`mb-1 flex w-full flex-col gap-1 rounded-xl px-3 py-2 text-left hover:bg-slate-900 ${r.id === selected ? 'bg-slate-900' : ''}`}
-              >
-                <div className="flex w-full items-center gap-2">
-                  <span className="min-w-0 flex-1 truncate text-sm text-slate-100">{r.title}</span>
-                  <Badge status={r.status} />
-                </div>
-                <span className="text-[11px] text-slate-500">{new Date(r.createdAt).toLocaleString()} · ${r.costUsd.toFixed(2)}</span>
-              </button>
-            ))}
-            {data && data.requests.length === 0 && <p className="px-3 py-2 text-sm text-slate-500">Nothing yet.</p>}
-          </div>
-        </aside>
-
-        <main className={`${current ? 'flex' : 'hidden md:flex'} min-w-0 flex-1 flex-col p-3 md:p-4`}>
-          {current ? (
-            <>
-              <div className="mb-3 flex shrink-0 items-center gap-2">
-                <button type="button" onClick={() => select(null)} className="rounded-lg p-1 text-slate-400 hover:text-white md:hidden" aria-label="All requests">
-                  <ArrowLeft size={16} />
+            <div className="tl-scroll -mx-1 min-h-0 flex-1 overflow-y-auto px-1">
+              {data?.requests.map((r) => (
+                <button key={r.id} type="button" onClick={() => setView(r.id)} className="mb-1 flex w-full flex-col gap-1 rounded-xl px-3 py-2 text-left hover:bg-slate-900">
+                  <div className="flex w-full items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate text-sm text-slate-100">{r.title}</span>
+                    <Badge status={r.status} />
+                  </div>
+                  <span className="text-[11px] text-slate-500">{new Date(r.createdAt).toLocaleString()} · ${r.costUsd.toFixed(2)}</span>
                 </button>
-                <h2 className="min-w-0 flex-1 truncate text-sm font-medium text-slate-300">{current.title}</h2>
-                <Badge status={current.status} />
-              </div>
-              <Thread r={current} onChange={() => void load()} />
-            </>
-          ) : (
-            <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center gap-4">
-              <div>
-                <h2 className="text-xl font-semibold text-slate-100">Suggest a change, or ask a question</h2>
-                <p className="mt-1 text-sm leading-relaxed text-slate-400">
-                  A coding agent on your PC works on it. Questions get an answer here. Code changes are checked, screenshotted and wait for your approval; approving pushes them to GitHub and Railway redeploys.
-                  {data && !data.workerOnline && ' Your PC is offline right now, so requests will wait until the worker is running.'}
-                </p>
-              </div>
-              <Composer
-                placeholder="e.g. Colonies keep crashing — make the world stable enough to hold a population. / Why does the background flicker?"
-                button="Send"
-                onSend={async (text, images) => {
-                  const { ok, json } = await send('/api/builder', { prompt: text, images });
-                  if (!ok) return json.error ?? 'That did not work.';
-                  await load();
-                  if (json.id) select(json.id);
-                  return null;
-                }}
-              />
+              ))}
+              {data && data.requests.length === 0 && <p className="px-3 py-2 text-sm text-slate-500">Nothing yet.</p>}
             </div>
-          )}
-        </main>
+          </>
+        )}
+
+        {view === 'new' && (
+          <div className="flex flex-1 flex-col justify-end gap-3">
+            <p className="text-sm leading-relaxed text-slate-400">
+              Suggest a change or ask a question. A coding agent on your PC works on it. Questions get an answer here; code changes are checked and screenshotted, then wait for your approval. Approving pushes them live.
+              {data && !data.workerOnline && ' Your PC is offline right now, so this will wait until the worker is running.'}
+            </p>
+            <Composer
+              placeholder="e.g. Make the 3D nebulae drift a bit faster. / Why do armored cells form on the edges?"
+              button="Send"
+              onSend={async (text, images) => {
+                const { ok, json } = await send('/api/builder', { prompt: text, images });
+                if (!ok) return json.error ?? 'That did not work.';
+                await load();
+                if (json.id) setView(json.id);
+                return null;
+              }}
+            />
+          </div>
+        )}
+
+        {current && <Thread r={current} onChange={() => void load()} />}
       </div>
     </div>
   );

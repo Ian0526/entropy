@@ -85,7 +85,7 @@ Locally, put secrets in a git-ignored `.env` (see `.env.example`); the server lo
 
 ## Builder
 
-Builder is a chat at `/builder` (the speech-bubble button in the app) where you suggest changes or ask questions in plain words. A coding agent (Claude Code, on your own Claude plan) runs on your PC and works on them in a clone kept only for it (`~/turinglife-builder/repo`), on an `agent/<id>` branch. Ported from the DIY site's Builder.
+Builder is a chat window inside the app (the speech-bubble button; `/builder` opens the app with it open) where you suggest changes or ask questions in plain words. A coding agent (Claude Code, on your own Claude plan) runs on your PC and works on them in a clone kept only for it (`~/turinglife-builder/repo`), on an `agent/<id>` branch. Ported from the DIY site's Builder.
 
 - **Questions** get an answer in the chat.
 - **Changes** are committed by the worker, which then runs `typecheck`, `selftest` and `build` (the agent gets one chance to fix failures) and screenshots the app from a local build. The proposal waits for you. **Approve** makes the worker push to `main`, and Railway redeploys. Follow-ups continue the same agent session.

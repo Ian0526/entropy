@@ -11,6 +11,7 @@ import TelemetryPanel from '../components/TelemetryPanel';
 import ActionBar, { PlayButton, SpeedControl, ToolPalette } from '../components/ActionBar';
 import { BottomSheet, MobileHUD, MobileToolbar, type SheetTab } from '../components/MobileLayout';
 import { Glass } from '../components/ui';
+import { BuilderChat } from './builder/BuilderChat';
 
 export default function App() {
   const sim = useSimulation();
@@ -23,6 +24,12 @@ export default function App() {
   const [selected, setSelected] = useState<{ x: number; y: number; z: number } | null>(null);
   const [inspectData, setInspectData] = useState<InspectResult | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
+  const [builderOpen, setBuilderOpen] = useState(() => new URLSearchParams(window.location.search).has('builder'));
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).has('builder')) window.history.replaceState(null, '', '/');
+  }, []);
+  const openBuilder = useCallback(() => setBuilderOpen(true), []);
+  const closeBuilder = useCallback(() => setBuilderOpen(false), []);
   const [sheetTab, setSheetTab] = useState<SheetTab>('physics');
   const [optimistic, setOptimistic] = useState<{ running?: boolean; speed?: SpeedMode; at: number }>({ at: 0 });
 
@@ -46,6 +53,8 @@ export default function App() {
     setInspectData(null);
   }, [sim]);
 
+  const builderOpenRef = useRef(builderOpen);
+  builderOpenRef.current = builderOpen;
   const runningRef = useRef(running);
   runningRef.current = running;
 
@@ -85,7 +94,7 @@ export default function App() {
       const el = e.target as HTMLElement | null;
       // Only text entry swallows hotkeys; range sliders keep focus after dragging and must not.
       const typing = el?.tagName === 'TEXTAREA' || (el?.tagName === 'INPUT' && (el as HTMLInputElement).type !== 'range');
-      if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (typing || e.metaKey || e.ctrlKey || e.altKey || builderOpenRef.current) return;
       const code = e.code;
       const digit = code.startsWith('Digit') ? Number(code.slice(5)) : NaN;
       if (digit >= 1 && digit <= 4) {
@@ -182,6 +191,7 @@ export default function App() {
         setKind={sim.setKind}
         world={sim.world}
         setWorld={sim.setWorld}
+        onOpenBuilder={openBuilder}
         params={t?.params}
         onParams={onParams}
         onReset={onReset}
@@ -212,7 +222,8 @@ export default function App() {
       />
 
       {/* ---------------- Mobile (< lg) ---------------- */}
-      <MobileHUD fps={fps} tps={t?.tps ?? 0} population={t?.population ?? 0} mode={t?.entropy.mode} />
+      <MobileHUD fps={fps} tps={t?.tps ?? 0} population={t?.population ?? 0} mode={t?.entropy.mode} onOpenBuilder={openBuilder} />
+      {builderOpen && <BuilderChat onClose={closeBuilder} />}
       <MobileToolbar onOpenSheet={() => setSheetOpen(true)}>
         <div className="tl-scroll flex items-center gap-2 overflow-x-auto pb-1">
           <PlayButton running={running} onToggle={() => setRunning(!running)} />

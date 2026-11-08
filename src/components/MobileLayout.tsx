@@ -6,7 +6,7 @@ import { QuantumBadge } from './QuantumEntropyHUD';
 import { cx } from './ui';
 
 /** Compact top HUD bar (< lg). */
-export function MobileHUD({ fps, tps, population, mode }: { fps: number; tps: number; population: number; mode: EntropyTelemetry['mode'] | undefined }) {
+export function MobileHUD({ fps, tps, population, mode, onOpenBuilder }: { fps: number; tps: number; population: number; mode: EntropyTelemetry['mode'] | undefined; onOpenBuilder: () => void }) {
   return (
     <div className="pointer-events-none absolute inset-x-0 top-0 z-20 lg:hidden" style={{ paddingTop: 'env(safe-area-inset-top)' }}>
       <div className="pointer-events-auto mx-2 mt-2 flex items-center gap-2 rounded-2xl border border-slate-800 bg-slate-950/80 px-3 py-2 backdrop-blur-md">
@@ -17,9 +17,9 @@ export function MobileHUD({ fps, tps, population, mode }: { fps: number; tps: nu
           <span><span className="text-slate-500">Pop</span> {fmt(population)}</span>
         </div>
         <QuantumBadge mode={mode} compact />
-        <a href="/builder" className="shrink-0 rounded-lg p-1 text-slate-400 active:text-emerald-300" title="Builder" aria-label="Builder">
+        <button type="button" onClick={onOpenBuilder} className="shrink-0 rounded-lg p-1 text-slate-400 active:text-emerald-300" title="Builder" aria-label="Builder">
           <MessageSquareText size={16} />
-        </a>
+        </button>
       </div>
     </div>
   );

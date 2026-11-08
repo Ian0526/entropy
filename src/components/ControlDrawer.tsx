@@ -167,6 +167,7 @@ export function PhysicsControls({ params, onChange, onReset }: {
 export default function ControlDrawer(props: {
   world: WorldId;
   setWorld: (w: WorldId) => void;
+  onOpenBuilder: () => void;
   kind: SourceKind;
   setKind: (k: SourceKind) => void;
   params: SimParams | undefined;
@@ -196,9 +197,9 @@ export default function ControlDrawer(props: {
           )}
           <div className="flex items-center gap-0.5">
             {open && (
-              <a href="/builder" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-emerald-300" title="Builder: suggest a change or ask a question">
+              <button type="button" onClick={props.onOpenBuilder} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-emerald-300" title="Builder: suggest a change or ask a question">
                 <MessageSquareText size={16} />
-              </a>
+              </button>
             )}
             <button type="button" onClick={() => setOpen(!open)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white" title={open ? 'Collapse' : 'Expand'}>
               {open ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
