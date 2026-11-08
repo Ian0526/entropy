@@ -12,17 +12,19 @@
  *   1. absorbQuantumSeed()       quantum indeterminism enters the SFC32 sponge
  *   2. food regeneration         drifting, tileable simplex pockets
  *   3. signal propagation        `signalSpeed` relay sub-steps through living tissue
- *   4. asynchronous cell pass    quantum-shuffled order, Poisson phase clocks
- *        maintenance → harvest → emission → predation → division | motility → epigenetics → death
- *   5. metabolic routing         conservative pairwise (Jacobi) energy pumping between kin
- *   6. flux & statistics
+ *   4. morphogenesis             Turing activator/inhibitor reaction–diffusion inside each body
+ *   5. asynchronous cell pass    quantum-shuffled order, Poisson phase clocks
+ *        maintenance → harvest → emission → predation → division | seed | motility → epigenetics → death
+ *   6. metabolic routing         conservative pairwise (Jacobi) energy pumping within one body
+ *   7. flux & statistics
  */
 import { QuantumEntropyEngine } from './QuantumEntropy';
 import { SimplexNoise2D, SimplexNoise3D } from './SimplexNoise';
 import {
   aggression, armorBias, chemoFood, chemoSignal, decodeGenome, divideThreshold, emitThreshold, gKin,
   harvestGain, kinRelation, makeAncestor, makePredator, motility, mutateInPlace, popcount32, pumpStrength,
-  sensorBias,
+  sensorBias, adultSize, axisFollowsGrowth, DEV_BACK, DEV_FWD, DEV_SIDE, growMask, isDevelopmental, makeBodyPlan,
+  mutateDev, seedRate, turingGain, turingRange, typeFor,
 } from './Genome';
 import {
   DEFAULT_PARAMS, LAYER, LAYER_COUNT, sanitizeParams,
@@ -70,7 +72,15 @@ const NOISE_CELL = 8; //             coarse food-noise lattice spacing (cells)
 const SIGNAL_A_DECAY = 0.9; //       per tick
 const SIGNAL_B_DECAY = 0.86;
 const SIGNAL_HOP = 0.86; //          attenuation per relay hop
-const KEY_SPECIES_MIN = 4; //        cells needed for a kin hash to count as a species
+const KEY_SPECIES_MIN = 4;
+// ---- morphogenesis (Gierer–Meinhardt with saturation, per body, no-flux at the body edge)
+const MORPH_STEPS = 4; //            reaction–diffusion sub-steps per tick
+const MORPH_DT = 0.35;
+const MORPH_DA = 0.03; //            activator diffusion (2D; scaled by 4/K in 3D for stability)
+const MORPH_NU = 1.4; //             inhibitor decay
+const MORPH_HIGH = 1.35; //          activator level counted as "high" (homogeneous state ≈ 1.25)
+/** Core cells next to a sensor of their own body harvest this much more (sensor-guided feeding). */
+const SENSOR_FEED_BONUS = 1.25; //        cells needed for a kin hash to count as a species
 
 /** Byte layout of the shared grid buffer. */
 export interface GridLayout {
@@ -108,6 +118,12 @@ export function gridLayout(W: number, H: number, D = 1): GridLayout {
   take('genome', N * 8);
   take('birth', N * 4);
   take('ancestor', 8);
+  take('dev', N * 4);
+  take('body', N * 4);
+  take('morphA', N * 4);
+  take('morphH', N * 4);
+  take('depth', N);
+  take('axis', N);
   return { bytes: align(o, 8), offsets };
 }
 
@@ -135,6 +151,17 @@ export class SimulationCore {
   readonly sigA: Float32Array;
   readonly sigB: Float32Array;
   readonly genome: Uint32Array;
+  /** Developmental genome word (word 2), one per cell. */
+  readonly dev: Uint32Array;
+  /** Organism id: cells grown from the same zygote / founder share it. 0 = none. */
+  readonly body: Uint32Array;
+  /** Turing pair: activator and inhibitor. */
+  readonly morphA: Float32Array;
+  readonly morphH: Float32Array;
+  /** Divisions since the zygote (saturates at 255). */
+  readonly depth: Uint8Array;
+  /** Body axis: index of the "forward" neighbour direction. */
+  readonly axis: Uint8Array;
   readonly birth: Uint32Array;
   readonly ancestor: Uint32Array;
 
@@ -146,6 +173,7 @@ export class SimulationCore {
   private readonly dE: Float32Array;
   private readonly speciesCount = new Uint32Array(65536);
   private readonly speciesTouched = new Uint16Array(65536);
+  private readonly bodyTag = new Uint32Array(65536);
   private readonly coarse: Float32Array;
   private readonly cw: number;
   private readonly ch: number;
@@ -166,6 +194,7 @@ export class SimulationCore {
   private driftBy = 0;
   private driftBz = 0;
   private lowPopTicks = 0;
+  private nextBody = 1;
 
   tick = 0;
   stats: SimStats;
@@ -197,6 +226,12 @@ export class SimulationCore {
     this.genome = new Uint32Array(b, off.genome, N * 2);
     this.birth = new Uint32Array(b, off.birth, N);
     this.ancestor = new Uint32Array(b, off.ancestor, 2);
+    this.dev = new Uint32Array(b, off.dev, N);
+    this.body = new Uint32Array(b, off.body, N);
+    this.morphA = new Float32Array(b, off.morphA, N);
+    this.morphH = new Float32Array(b, off.morphH, N);
+    this.depth = new Uint8Array(b, off.depth, N);
+    this.axis = new Uint8Array(b, off.axis, N);
 
     const K = this.K;
     const Dd = this.D;
@@ -246,7 +281,7 @@ export class SimulationCore {
 
   private emptyStats(): SimStats {
     return {
-      tick: 0, population: 0, core: 0, armor: 0, sensor: 0, births: 0, deaths: 0, predations: 0,
+      tick: 0, population: 0, core: 0, armor: 0, sensor: 0, births: 0, deaths: 0, predations: 0, seeds: 0, organisms: 0, organismCells: 0,
       species: 0, meanEnergy: 0, totalFood: 0, meanDistance: 0, topSpecies: [],
     };
   }
@@ -270,6 +305,13 @@ export class SimulationCore {
     this.sigA.fill(0);
     this.sigB.fill(0);
     this.genome.fill(0);
+    this.dev.fill(0);
+    this.body.fill(0);
+    this.morphA.fill(0);
+    this.morphH.fill(0);
+    this.depth.fill(0);
+    this.axis.fill(0);
+    this.nextBody = 1;
     this.birth.fill(0);
     this.tick = 0;
     Atomics.store(this.header, HDR.TICK, 0);
@@ -344,20 +386,33 @@ export class SimulationCore {
       }
       if (ok) picks.push(best);
     }
-    for (const p of picks) {
+    // Half the founder lineages start as bounded organisms with a body plan, half as open-ended
+    // colonies (same plan, developmental bit off), so selection decides which way of life wins.
+    const plan = makeBodyPlan();
+    picks.forEach((p, n) => {
       // Each founder lineage differs from the ancestor by a couple of kin-hash bits + light mutation.
       const g0 = this.ancestor[0];
       let g1 = this.ancestor[1];
       g1 = (g1 ^ (1 << (q.nextUint32() & 15)) ^ (1 << (q.nextUint32() & 15))) >>> 0;
-      this.stampDisk(p % W, ((p / W) | 0) % H, 3, g0, g1, 0.7, false, (p / WH) | 0);
-    }
+      const organism = (n & 1) === 1;
+      const dev = organism ? plan : (plan & ~(1 << 30)) >>> 0;
+      const x = p % W, y = ((p / W) | 0) % H, z = (p / WH) | 0;
+      if (organism) {
+        // Three zygotes: single cells that each develop into an organism.
+        for (let s = 0; s < 3; s++) this.stampDisk(x + s * 4, y, 0, g0, g1, 0.9, false, z, dev);
+      } else {
+        this.stampDisk(x, y, 3, g0, g1, 0.7, false, z, dev);
+      }
+    });
   }
 
   /** Write a disk of fresh cells sharing a genome (mutated lightly per cell). */
   /** A disk (2D) or ball (3D) of founder cells centred on (cx, cy, cz). */
-  private stampDisk(cx: number, cy: number, r: number, g0: number, g1: number, e: number, predator: boolean, cz = 0): number {
+  private stampDisk(cx: number, cy: number, r: number, g0: number, g1: number, e: number, predator: boolean, cz = 0, dev = 0): number {
     const q = this.q;
     let placed = 0;
+    const bodyId = this.newBodyId();
+    const ax = q.nextUint32() % this.K;
     const rz = this.D > 1 ? r : 0;
     for (let dz = -rz; dz <= rz; dz++)
     for (let dy = -r; dy <= r; dy++) {
@@ -379,6 +434,13 @@ export class SimulationCore {
         mutateInPlace(this.genome, i * 2, this.params.mutationRate * 0.5, q);
         // Keep the founder's kin hash intact so the colony recognises itself.
         this.genome[i * 2 + 1] = ((this.genome[i * 2 + 1] & 0xffff0000) | (g1 & 0xffff)) >>> 0;
+        this.dev[i] = dev;
+        if (r > 0) mutateDev(this.dev, i, this.params.mutationRate * 0.5, q); // a lone zygote keeps its plan exactly
+        this.body[i] = bodyId;
+        this.depth[i] = 0;
+        this.axis[i] = ax;
+        this.morphA[i] = 1.25 + (q.nextFloat() - 0.5) * 0.2;
+        this.morphH[i] = 1.1;
         this.epi[i] = 0;
         this.birth[i] = this.tick;
         placed++;
@@ -595,6 +657,129 @@ export class SimulationCore {
     return c;
   }
 
+  private newBodyId(): number {
+    const id = this.nextBody >>> 0 || 1;
+    this.nextBody = (id + 1) >>> 0;
+    return id;
+  }
+
+  /** Live neighbours of n that belong to body b (excluding `exclude`). */
+  private bodyNeighbours(n: number, b: number, exclude: number): number {
+    const K = this.K;
+    const k = n * K;
+    let c = 0;
+    for (let d = 0; d < K; d++) {
+      const j = this.nbr[k + d];
+      if (j !== exclude && this.somatic[j] !== 0 && this.body[j] === b) c++;
+    }
+    return c;
+  }
+
+  /** Copy the inherited, non-genomic developmental state of a parent cell into a child. */
+  private inheritDev(child: number, parent: number, depth: number, ax: number): void {
+    this.dev[child] = this.dev[parent];
+    this.body[child] = this.body[parent];
+    this.depth[child] = depth > 255 ? 255 : depth;
+    this.axis[child] = ax;
+    // Quantum jitter (±5 %) on the inherited activator: the seed of every Turing pattern.
+    this.morphA[child] = this.morphA[parent] * (0.95 + this.q.nextFloat() * 0.1);
+    this.morphH[child] = this.morphH[parent];
+  }
+
+  /**
+   * Morphogenesis: a Gierer–Meinhardt activator/inhibitor pair reacts inside every developmental
+   * cell and diffuses only between cells of the same body (no-flux at the body edge). The inhibitor
+   * spreads faster than the activator, so a uniform body spontaneously breaks into spots, stripes
+   * and rings (a Turing instability). The genome sets the gain and the inhibitor range.
+   */
+  private developMorphogens(live: Uint32Array, m: number): void {
+    const K = this.K;
+    const nbr = this.nbr;
+    const som = this.somatic;
+    const A = this.morphA;
+    const Hh = this.morphH;
+    const body = this.body;
+    const dev = this.dev;
+    const na = this.tmpA;
+    const nh = this.tmpB;
+    const scale = 4 / K;
+    const da = MORPH_DA * scale;
+    for (let s = 0; s < MORPH_STEPS; s++) {
+      for (let k = 0; k < m; k++) {
+        const i = live[k];
+        const w2 = dev[i];
+        if (!isDevelopmental(w2)) continue;
+        const b = body[i];
+        const a = A[i];
+        const h = Hh[i];
+        let la = 0;
+        let lh = 0;
+        const nk = i * K;
+        for (let d = 0; d < K; d++) {
+          const j = nbr[nk + d];
+          if (som[j] === 0 || body[j] !== b) continue;
+          la += A[j] - a;
+          lh += Hh[j] - h;
+        }
+        const rho = turingGain(w2);
+        const a2 = a * a;
+        let va = a + MORPH_DT * (rho * (a2 / ((h + 1e-3) * (1 + 0.1 * a2)) + 0.02) - a) + da * la;
+        let vh = h + MORPH_DT * (rho * a2 - MORPH_NU * h) + turingRange(w2) * scale * lh;
+        va = va < 0 ? 0 : va > 8 ? 8 : va;
+        vh = vh < 1e-3 ? 1e-3 : vh > 8 ? 8 : vh;
+        na[i] = va;
+        nh[i] = vh;
+      }
+      for (let k = 0; k < m; k++) {
+        const i = live[k];
+        if (!isDevelopmental(dev[i])) continue;
+        A[i] = na[i];
+        Hh[i] = nh[i];
+      }
+    }
+  }
+
+  /**
+   * Reproduction through a bottleneck: a mature cell of a developmental organism ejects a single
+   * cell 2–5 tiles out past its tail. The seed is a fresh zygote — new body id, depth 0, a random
+   * axis — that grows its own body. Energy: the parent pays REPLICATION_COST and gives the seed half
+   * of what remains, exactly like a division. Returns the parent's remaining energy, or -1 if no seed.
+   */
+  private releaseSeed(i: number, e: number): number {
+    const K = this.K;
+    const nbr = this.nbr;
+    const q = this.q;
+    const back = (this.axis[i] + (K >> 1)) % K;
+    const hops = 2 + (q.nextUint32() & 3);
+    let t = i;
+    for (let h = 0; h < hops; h++) t = nbr[t * K + back];
+    if (this.somatic[t] !== 0 || this.terrain[t] !== 0 || this.bodyNeighbours(t, this.body[i], -1) > 0) return -1;
+    const half = (e - REPLICATION_COST) * 0.5;
+    const g = this.genome;
+    this.somatic[t] = SOMA.CORE;
+    this.energy[t] = half;
+    this.energyPrev[t] = half;
+    g[t * 2] = g[i * 2];
+    g[t * 2 + 1] = g[i * 2 + 1];
+    // The germline: seeds are the only place an organism's genome mutates (at 3× the rate,
+    // since there are far fewer seeds than divisions).
+    const mu = Math.min(0.9, this.params.mutationRate * 3);
+    mutateInPlace(g, t * 2, mu, q);
+    this.dev[t] = this.dev[i];
+    mutateDev(this.dev, t, mu, q);
+    this.body[t] = this.newBodyId();
+    this.depth[t] = 0;
+    this.axis[t] = q.nextUint32() % K;
+    this.morphA[t] = 1.25 + (q.nextFloat() - 0.5) * 0.2;
+    this.morphH[t] = 1.1;
+    this.epi[t] = 0;
+    this.birth[t] = this.tick;
+    this.flux[t] = 0;
+    this.stats.births++;
+    this.stats.seeds++;
+    return half;
+  }
+
   private killCell(i: number): void {
     const e = this.energy[i];
     const f = this.food[i] + BODY_MASS_RETURN + (e > 0 ? e * 0.5 : 0);
@@ -612,6 +797,7 @@ export class SimulationCore {
     this.epi[to] = this.epi[from];
     this.genome[to * 2] = this.genome[from * 2];
     this.genome[to * 2 + 1] = this.genome[from * 2 + 1];
+    this.inheritDev(to, from, this.depth[from], this.axis[from]);
     this.flux[to] = this.flux[from];
     this.birth[to] = this.tick;
     this.somatic[from] = 0;
@@ -629,6 +815,7 @@ export class SimulationCore {
     this.tick = (this.tick + 1) >>> 0;
     const tick = this.tick;
     this.stats.births = 0;
+    this.stats.seeds = 0;
     this.stats.deaths = 0;
     this.stats.predations = 0;
 
@@ -656,6 +843,13 @@ export class SimulationCore {
     let m = 0;
     for (let i = 0; i < N; i++) if (som[i] !== 0) order[m++] = i;
     this.propagateSignals(order, m);
+    this.developMorphogens(order, m);
+    const dev = this.dev;
+    const body = this.body;
+    const depth = this.depth;
+    const axis = this.axis;
+    const morphA = this.morphA;
+    const HALF = K >> 1;
     for (let k = m - 1; k > 0; k--) {
       const j = q.nextInt(k + 1);
       const t = order[k];
@@ -670,6 +864,8 @@ export class SimulationCore {
       const w0 = genome[i * 2];
       const w1 = genome[i * 2 + 1];
       const kin = w1 & 0xffff;
+      const w2 = dev[i];
+      const organism = isDevelopmental(w2);
       const epBefore = epi[i];
       let ep = epBefore;
       const starving = (ep & EPI_STARVING) !== 0;
@@ -683,7 +879,19 @@ export class SimulationCore {
         const nk = i * K;
 
         // -- 2. harvest
-        const hg = HARVEST[t] * harvestGain(w0) * (starving ? 1.2 : 1);
+        let hg = HARVEST[t] * harvestGain(w0) * (starving ? 1.2 : 1);
+        if (t === SOMA.CORE) {
+          // Sensor-guided feeding: a core cell touching a sensor of its own body eats better,
+          // so where sensors sit relative to the gut matters (shape pays).
+          const bi = body[i];
+          for (let d = 0; d < K; d++) {
+            const j = nbr[nk + d];
+            if (som[j] === SOMA.SENSOR && body[j] === bi) {
+              hg *= SENSOR_FEED_BONUS;
+              break;
+            }
+          }
+        }
         const h = food[i] * hg;
         if (h > 0) {
           food[i] -= h;
@@ -733,23 +941,50 @@ export class SimulationCore {
         let divided = false;
         const cf = chemoFood(w0) * (starving ? 1.6 : 1);
         const cs = chemoSignal(w0);
+        const high = morphA[i] > MORPH_HIGH;
+        const mature = organism && depth[i] >= adultSize(w2);
         if (e > divideThreshold(w0) + REPLICATION_COST && food[i] >= ECO.divideFoodMin) {
           let best = -1;
+          let bestDir = 0;
           let bestScore = -1e9;
+          // Organisms grow only along the directions their body plan allows (relative to the axis),
+          // and stop at adult size; colonies grow anywhere, preferring compact, wound-filling spots.
+          const mask = mature ? 0 : organism ? growMask(w2, high) : 7;
+          const ax = axis[i];
           for (let d = 0; d < K; d++) {
+            const rel = d === ax ? DEV_FWD : d === (ax + HALF) % K ? DEV_BACK : DEV_SIDE;
+            if ((mask & rel) === 0) continue;
             const n = nbr[nk + d];
             if (som[n] !== 0 || terrain[n] !== 0) continue;
-            const score = cf * (food[n] - food[i]) * 4 + cs * (sigA[n] - sigA[i]) * 2
-              + 0.35 * this.kinNeighbours(n, kin, i) // wound-filling / compactness → homeostatic healing
-              + q.nextFloat() * 0.3;
+            // Organisms follow their body plan, not the local food (development is internal);
+            // colonies chase gradients and fill wounds (compactness → homeostatic healing).
+            const score = organism ? q.nextFloat()
+              : cf * (food[n] - food[i]) * 4 + cs * (sigA[n] - sigA[i]) * 2
+                + 0.35 * this.kinNeighbours(n, kin, i) + q.nextFloat() * 0.3;
             if (score > bestScore) {
               bestScore = score;
               best = n;
+              bestDir = d;
+            }
+          }
+          if (best < 0 && mature && q.nextFloat() < seedRate(w2)) {
+            const rest = this.releaseSeed(i, e);
+            if (rest >= 0) {
+              e = rest;
+              divided = true;
             }
           }
           if (best >= 0) {
-            const avail = e - REPLICATION_COST;
-            const half = avail * 0.5;
+            // Mirror rule: an organism budding sideways buds the opposite side in the same act
+            // (paired division, two REPLICATION_COSTs, energy split three ways), so bodies grow
+            // bilaterally symmetric unless something blocks one side.
+            let twin = -1;
+            if (organism && bestDir !== axis[i] && bestDir !== (axis[i] + HALF) % K) {
+              const tn = nbr[nk + (bestDir + HALF) % K];
+              if (som[tn] === 0 && terrain[tn] === 0 && e > 3 * REPLICATION_COST + divideThreshold(w0)) twin = tn;
+            }
+            const avail = e - REPLICATION_COST * (twin >= 0 ? 2 : 1);
+            const half = twin >= 0 ? avail / 3 : avail * 0.5;
             e = half;
             // Differentiation: alarm signals & damage memory → armor; exposed edges → sensors.
             const alarm = sigB[i] + (damaged ? 0.5 : 0);
@@ -757,24 +992,55 @@ export class SimulationCore {
             const edge = this.kinNeighbours(best, kin, i) <= 1 ? 1 : 0.25;
             const pSensor = Math.min(0.9 - pArmor, 0.05 + sensorBias(w1) * 0.35 * edge);
             const roll = q.nextFloat();
-            som[best] = roll < pArmor ? SOMA.ARMOR : roll < pArmor + pSensor ? SOMA.SENSOR : SOMA.CORE;
+            // Organisms read their cell type from the genome's rule table (activator level × edge);
+            // alarm still forces armor. Entry 0, and every colony, uses the legacy probabilistic roll.
+            const rule = organism ? typeFor(w2, high, this.bodyNeighbours(best, body[i], i) <= 1) : 0;
+            som[best] = alarm > 0.5 && organism ? SOMA.ARMOR
+              : rule !== 0 ? rule
+              : roll < pArmor ? SOMA.ARMOR : roll < pArmor + pSensor ? SOMA.SENSOR : SOMA.CORE;
             energy[best] = half;
             this.energyPrev[best] = half;
             genome[best * 2] = w0;
             genome[best * 2 + 1] = w1;
-            mutateInPlace(genome, best * 2, mu, q);
+            // Organisms keep a germline: body cells are clones and mutation happens only in seeds.
+            if (!organism) mutateInPlace(genome, best * 2, mu, q);
+            this.inheritDev(best, i, depth[i] + 1, organism && axisFollowsGrowth(w2) ? bestDir : axis[i]);
+            if (!organism) {
+              mutateDev(dev, best, mu, q);
+              // A colony cell that mutates into a developmental one starts life as a zygote.
+              if (isDevelopmental(dev[best])) {
+                body[best] = this.newBodyId();
+                depth[best] = 0;
+              }
+            }
             epi[best] = ep & EPI_DAMAGED; // damage memory is epigenetically inherited
             birth[best] = tick;
             this.flux[best] = 0;
             this.stats.births++;
             divided = true;
+            if (twin >= 0) {
+              som[twin] = som[best];
+              energy[twin] = half;
+              this.energyPrev[twin] = half;
+              genome[twin * 2] = w0;
+              genome[twin * 2 + 1] = w1;
+              this.inheritDev(twin, i, depth[i] + 1, axisFollowsGrowth(w2) ? (bestDir + HALF) % K : axis[i]);
+              epi[twin] = epi[best];
+              birth[twin] = tick;
+              this.flux[twin] = 0;
+              this.stats.births++;
+            }
           }
         }
 
         // -- 6. re-differentiation (homeostasis): armor up under threat, relax when calm
-        if (!divided && q.nextFloat() < 0.01) {
+        if (!divided && q.nextFloat() < (organism ? 0.03 : 0.01)) {
           if (t === SOMA.CORE && sigB[i] > 0.5) som[i] = SOMA.ARMOR;
-          else if (t === SOMA.ARMOR && sigB[i] < 0.05 && !damaged) som[i] = SOMA.CORE;
+          else if (organism && sigB[i] < 0.05 && !damaged) {
+            // Organisms re-read their rulebook as the Turing pattern settles (edge = any open side).
+            const rule = typeFor(w2, high, this.bodyNeighbours(i, body[i], -1) < K);
+            if (rule !== 0) som[i] = rule;
+          } else if (t === SOMA.ARMOR && sigB[i] < 0.05 && !damaged) som[i] = SOMA.CORE;
         }
 
         // -- 7. motility: cilia crawl up the food / signal gradient, staying attached to kin
@@ -840,6 +1106,7 @@ export class SimulationCore {
     const sigB = this.sigB;
     const nbr = this.nbr;
     const dE = this.dE;
+    const body = this.body;
     const K = this.K;
     const FWD = K >> 1; // forward neighbours only, so each pair is visited once
     dE.fill(0);
@@ -847,13 +1114,14 @@ export class SimulationCore {
       if (som[i] === 0) continue;
       const wi = genome[i * 2 + 1];
       const ki = wi & 0xffff;
+      const bi = body[i];
       const pi = pumpStrength(wi);
       const ei = energy[i];
       for (let d = 0; d < FWD; d++) {
         const j = nbr[i * K + d];
         if (som[j] === 0) continue;
         const wj = genome[j * 2 + 1];
-        if (kinRelation(ki, wj & 0xffff) === 2) continue;
+        if (body[j] !== bi || kinRelation(ki, wj & 0xffff) === 2) continue;
         const k = (pi + pumpStrength(wj)) * 0.1;
         const ej = energy[j];
         let f = k * (ei - ej) + k * 0.15 * (sigB[j] - sigB[i]);
@@ -965,8 +1233,21 @@ export class SimulationCore {
     const touched = this.speciesTouched;
     let nt = 0;
     const g = this.genome;
+    const tag = this.bodyTag;
+    tag.fill(0);
+    let organisms = 0;
+    let organismCells = 0;
     for (let i = 0; i < this.N; i++) {
       if (this.somatic[i] === 0) continue;
+      if (isDevelopmental(this.dev[i])) {
+        organismCells++;
+        const b = this.body[i];
+        const slot = (Math.imul(b, 0x9e3779b1) >>> 16) & 0xffff; // hashed; rare collisions can miscount slightly
+        if (tag[slot] !== b) {
+          tag[slot] = b;
+          organisms++;
+        }
+      }
       const k = g[i * 2 + 1] & 0xffff;
       if (cnt[k] === 0) touched[nt++] = k;
       cnt[k]++;
@@ -987,6 +1268,8 @@ export class SimulationCore {
       cnt[k] = 0;
     }
     this.stats.species = species;
+    this.stats.organisms = organisms;
+    this.stats.organismCells = organismCells;
     this.stats.topSpecies = top;
   }
 
@@ -1037,7 +1320,16 @@ export class SimulationCore {
             if (this.somatic[i] === 0 || q.nextFloat() > 0.3 + 0.6 * falloff) break;
             const flips = 1 + Math.floor(strength * 5 * q.nextFloat());
             for (let f = 0; f < flips; f++) {
-              const bit = q.nextUint32() & 63;
+              const bit = q.nextUint32() % 96;
+              if (bit >= 64) {
+                this.dev[i] = (this.dev[i] ^ (1 << (bit & 31))) >>> 0;
+                if ((bit & 31) === 30) {
+                  // Switching way of life: the cell becomes a fresh zygote / colony founder.
+                  this.body[i] = this.newBodyId();
+                  this.depth[i] = 0;
+                }
+                continue;
+              }
               const w = i * 2 + (bit >> 5);
               this.genome[w] = (this.genome[w] ^ (1 << (bit & 31))) >>> 0;
             }
@@ -1091,7 +1383,10 @@ export class SimulationCore {
       flux: this.flux[i],
       age: alive ? (this.tick - this.birth[i]) >>> 0 : 0,
       epigenetic: { damaged: (this.epi[i] & EPI_DAMAGED) !== 0, starving: (this.epi[i] & EPI_STARVING) !== 0, raw: this.epi[i] & 3 },
-      genome: alive ? decodeGenome(w0, w1) : null,
+      genome: alive ? decodeGenome(w0, w1, this.dev[i]) : null,
+      development: alive
+        ? { body: this.body[i], depth: this.depth[i], axis: this.axis[i], activator: this.morphA[i], inhibitor: this.morphH[i] }
+        : null,
       ancestorDistance: dist,
       relationToAncestor: rel === 0 ? 'self' : rel === 1 ? 'kin' : 'foreign',
       cluster: alive ? this.floodCluster(i) : null,

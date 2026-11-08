@@ -24,6 +24,9 @@ export default function TelemetryPanel({ t, history, fps }: { t: SimTelemetry | 
         <Stat label="Births" value={t?.births ?? 0} />
         <Stat label="Deaths" value={t?.deaths ?? 0} />
         <Stat label="Predation" value={t?.predations ?? 0} tone="text-rose-200" />
+        <Stat label="Organisms" value={fmt(t?.organisms ?? 0)} tone="text-fuchsia-200" />
+        <Stat label="In bodies" value={`${pop ? Math.round(((t?.organismCells ?? 0) / pop) * 100) : 0}%`} tone="text-fuchsia-200" />
+        <Stat label="Seeds" value={t?.seeds ?? 0} tone="text-fuchsia-200" />
       </div>
       {t && pop > 0 && (
         <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-slate-800" title="Somatic composition">

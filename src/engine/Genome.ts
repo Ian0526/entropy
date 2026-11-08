@@ -9,6 +9,17 @@
  *  bits 24-29  chemoSignal      (6, signed) bits 30-31  armorBias      (2)
  *  bits 30-31  motility         (2)
  *
+ * Word 2 — the developmental program ("dev" word, stored in its own array):
+ *  bits  0-3   turingGain     (4)  activator self-production of the Turing pair
+ *  bits  4-7   turingRange    (4)  inhibitor diffusion (pattern wavelength)
+ *  bits  8-11  adultSize      (4)  max divisions from the zygote (2 … 17)
+ *  bits 12-14  growLow        (3)  growth directions when the activator is low: forward | back | sideways
+ *  bits 15-17  growHigh       (3)  growth directions when the activator is high
+ *  bits 18-25  typeTable      (8)  4 × 2-bit cell type for (activator high?, edge?): 0 legacy roll, 1 core, 2 armor, 3 sensor
+ *  bits 26-29  seedRate       (4)  how readily mature cells release a single-cell seed
+ *  bit  30     developmental  (1)  1 = bounded organism with a body plan; 0 = open-ended colony (legacy)
+ *  bit  31     axisMode       (1)  0 = children keep the parent's axis (bilateral); 1 = axis follows growth (radial)
+ *
  * Every accessor is a branch-free shift/mask so it can be inlined in the hot loop.
  */
 import type { QuantumEntropyEngine } from './QuantumEntropy';
@@ -27,6 +38,63 @@ export const gPump = (w1: number) => (w1 >>> 16) & M6;
 export const gAggression = (w1: number) => (w1 >>> 22) & M6;
 export const gSensorBias = (w1: number) => (w1 >>> 28) & 3;
 export const gArmorBias = (w1: number) => (w1 >>> 30) & 3;
+
+// ---- developmental word (w2) -------------------------------------------------
+export const DEV_FWD = 1;
+export const DEV_BACK = 2;
+export const DEV_SIDE = 4;
+export const isDevelopmental = (w2: number) => ((w2 >>> 30) & 1) === 1;
+export const axisFollowsGrowth = (w2: number) => ((w2 >>> 31) & 1) === 1;
+export const turingGain = (w2: number) => 0.7 + (w2 & 15) * 0.04; //               0.7 … 1.3
+export const turingRange = (w2: number) => 0.12 + ((w2 >>> 4) & 15) * 0.008; //     0.12 … 0.24 (2D)
+export const adultSize = (w2: number) => 2 + ((w2 >>> 8) & 15); //                  2 … 17
+export const growMask = (w2: number, high: boolean) => (w2 >>> (high ? 15 : 12)) & 7;
+/** Cell type for (activator high, at an edge): 0 = legacy probabilistic roll, else SOMA code. */
+export const typeFor = (w2: number, high: boolean, edge: boolean) => (w2 >>> (18 + ((high ? 2 : 0) | (edge ? 1 : 0)) * 2)) & 3;
+export const seedRate = (w2: number) => 0.02 + ((w2 >>> 26) & 15) * 0.02; //       0.02 … 0.32 per mature action
+
+export function packDev(f: {
+  gain: number; range: number; size: number; growLow: number; growHigh: number;
+  types: [number, number, number, number]; seed: number; developmental: boolean; radial: boolean;
+}): number {
+  return (
+    ((f.gain & 15) |
+      ((f.range & 15) << 4) |
+      ((f.size & 15) << 8) |
+      ((f.growLow & 7) << 12) |
+      ((f.growHigh & 7) << 15) |
+      ((f.types[0] & 3) << 18) | ((f.types[1] & 3) << 20) | ((f.types[2] & 3) << 22) | ((f.types[3] & 3) << 24) |
+      ((f.seed & 15) << 26) |
+      ((f.developmental ? 1 : 0) << 30) |
+      ((f.radial ? 1 : 0) << 31)) >>>
+    0
+  );
+}
+
+/**
+ * A starter body plan: grow in every direction where the activator is low, only along the axis
+ * where it peaks; core tissue, with sensors on the edge wherever the activator peaks (Turing spots),
+ * a mid-sized adult that sheds seeds. Evolution takes it from there.
+ */
+export function makeBodyPlan(): number {
+  return packDev({
+    gain: 8, range: 15, size: 7, growLow: DEV_FWD | DEV_BACK | DEV_SIDE, growHigh: DEV_FWD | DEV_BACK,
+    types: [1, 1, 1, 3], seed: 6, developmental: true, radial: false,
+  });
+}
+
+/** Mutate the developmental word: geometric bit flips plus an occasional ±1..2 nudge of a 4-bit field. */
+const DEV_FIELD_SHIFTS = [0, 4, 8, 26];
+export function mutateDev(dev: Uint32Array, i: number, mu: number, q: QuantumEntropyEngine): void {
+  while (q.nextFloat() < mu) dev[i] = (dev[i] ^ (1 << (q.nextUint32() & 31))) >>> 0;
+  if (q.nextFloat() < mu) {
+    const sh = DEV_FIELD_SHIFTS[q.nextUint32() & 3];
+    const cur = (dev[i] >>> sh) & 15;
+    let nv = Math.round(cur + q.nextGaussian() * 1.5);
+    nv = nv < 0 ? 0 : nv > 15 ? 15 : nv;
+    dev[i] = ((dev[i] & ~(15 << sh)) | (nv << sh)) >>> 0;
+  }
+}
 
 // ---- phenotype mapping -----------------------------------------------------
 export const harvestGain = (w0: number) => 0.5 + gHarvest(w0) / 63; //            0.5 … 1.5
@@ -137,9 +205,22 @@ export interface DecodedGenome {
   aggression: number;
   sensorBias: number;
   armorBias: number;
+  /** Developmental program (word 2). */
+  dev: {
+    word: number;
+    developmental: boolean;
+    radial: boolean;
+    adultSize: number;
+    turingGain: number;
+    turingRange: number;
+    growLow: number;
+    growHigh: number;
+    types: [number, number, number, number];
+    seedRate: number;
+  };
 }
 
-export function decodeGenome(w0: number, w1: number): DecodedGenome {
+export function decodeGenome(w0: number, w1: number, w2 = 0): DecodedGenome {
   return {
     hex: (w1 >>> 0).toString(16).padStart(8, '0') + (w0 >>> 0).toString(16).padStart(8, '0'),
     words: [w0 >>> 0, w1 >>> 0],
@@ -154,5 +235,17 @@ export function decodeGenome(w0: number, w1: number): DecodedGenome {
     aggression: aggression(w1),
     sensorBias: sensorBias(w1),
     armorBias: armorBias(w1),
+    dev: {
+      word: w2 >>> 0,
+      developmental: isDevelopmental(w2),
+      radial: axisFollowsGrowth(w2),
+      adultSize: adultSize(w2),
+      turingGain: turingGain(w2),
+      turingRange: turingRange(w2),
+      growLow: growMask(w2, false),
+      growHigh: growMask(w2, true),
+      types: [typeFor(w2, false, false), typeFor(w2, false, true), typeFor(w2, true, false), typeFor(w2, true, true)],
+      seedRate: seedRate(w2),
+    },
   };
 }

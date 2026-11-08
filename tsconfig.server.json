@@ -21,6 +21,7 @@
     "src/engine",
     "scripts/selftest.ts",
     "scripts/ecology.ts",
+    "scripts/morphology.ts",
     "scripts/builder"
   ]
 }

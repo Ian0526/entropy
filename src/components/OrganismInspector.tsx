@@ -152,6 +152,27 @@ export default function OrganismInspector({ data, onClose, tracking }: {
             </div>
           )}
 
+          {g && data.development && (
+            <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-2 text-[11px]">
+              <div className="mb-1 flex justify-between">
+                <span className="text-slate-400">Development</span>
+                <span className="font-mono text-slate-200">
+                  {g.dev.developmental ? `organism #${data.development.body}` : 'open colony'}
+                </span>
+              </div>
+              {g.dev.developmental && (
+                <div className="space-y-1">
+                  <Bar label="Turing activator" value={data.development.activator} max={3} color="bg-fuchsia-400" />
+                  <Bar label="Inhibitor" value={data.development.inhibitor} max={3} color="bg-indigo-400" />
+                  <div className="flex justify-between font-mono text-[10px] text-slate-500">
+                    <span>growth {data.development.depth}/{g.dev.adultSize} · {g.dev.radial ? 'radial' : 'bilateral'}</span>
+                    <span>seeds {(g.dev.seedRate * 100).toFixed(0)}%</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {cl && (
             <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-2">
               <div className="mb-1 flex justify-between text-[11px]">

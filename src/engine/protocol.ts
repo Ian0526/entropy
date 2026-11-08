@@ -144,6 +144,12 @@ export interface SimStats {
   births: number;
   deaths: number;
   predations: number;
+  /** Single-cell seeds released by developmental organisms this tick. */
+  seeds: number;
+  /** Distinct developmental organisms (bodies grown from one zygote) alive. */
+  organisms: number;
+  /** Cells that belong to a developmental organism. */
+  organismCells: number;
   species: number;
   meanEnergy: number;
   totalFood: number;
@@ -199,6 +205,8 @@ export interface InspectResult {
   ancestorDistance: number;
   relationToAncestor: 'self' | 'kin' | 'foreign';
   cluster: ClusterStats | null;
+  /** Developmental state: organism id, divisions since the zygote, axis, Turing activator/inhibitor. */
+  development: { body: number; depth: number; axis: number; activator: number; inhibitor: number } | null;
 }
 
 /** Client → server/worker control messages (JSON). */

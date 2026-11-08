@@ -19,7 +19,8 @@
     "selftest": "tsx scripts/selftest.ts",
     "builder": "tsx scripts/builder/worker.ts",
     "builder:full": "tsx scripts/builder/worker.ts --dangerously-skip-permissions",
-    "ecology": "tsx scripts/ecology.ts"
+    "ecology": "tsx scripts/ecology.ts",
+    "morphology": "tsx scripts/morphology.ts"
   },
   "dependencies": {
     "@fastify/static": "^10.1.10",

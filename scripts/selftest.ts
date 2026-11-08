@@ -4,6 +4,7 @@
  */
 import { QuantumEntropyEngine, POOL_SIZE } from '../src/engine/QuantumEntropy';
 import { SimulationCore } from '../src/engine/SimulationCore';
+import { adultSize, isDevelopmental } from '../src/engine/Genome';
 import { LAYER_COUNT } from '../src/engine/protocol';
 
 let failures = 0;
@@ -91,11 +92,13 @@ function check(name: string, cond: boolean, detail = ''): void {
   const TICKS = 1500;
   let maxPop = 0;
   let minAfter = Infinity;
+  let seeds = 0;
   for (let t = 1; t <= TICKS; t++) {
     const t0 = performance.now();
     sim.step();
     totalMs += performance.now() - t0;
     const s = sim.stats;
+    seeds += s.seeds;
     maxPop = Math.max(maxPop, s.population);
     if (t > 300) minAfter = Math.min(minAfter, s.population);
     if (t % 150 === 0) {
@@ -123,6 +126,22 @@ function check(name: string, cond: boolean, detail = ''): void {
   check('life persists after warm-up', minAfter > 50, `min=${minAfter}`);
   check('speciation happened', sim.stats.species >= 1 && sim.stats.meanDistance > 0, `species=${sim.stats.species}`);
 
+  // Development: bounded organisms, single-cell seeds, Turing patterning, adult size respected.
+  let devCells = 0;
+  let highA = 0;
+  let oversize = 0;
+  for (let i = 0; i < sim.N; i++) {
+    if (sim.somatic[i] === 0 || !isDevelopmental(sim.dev[i])) continue;
+    devCells++;
+    if (sim.morphA[i] > 1.35) highA++;
+    if (sim.depth[i] > adultSize(sim.dev[i])) oversize++;
+  }
+  console.log(`      organisms=${sim.stats.organisms} cells=${devCells} seeds=${seeds} highActivator=${((highA / Math.max(1, devCells)) * 100).toFixed(1)}%`);
+  check('organisms persist', sim.stats.organisms >= 5 && devCells > 50, `organisms=${sim.stats.organisms}`);
+  check('organisms reproduce through seeds', seeds >= 10, `seeds=${seeds}`);
+  check('Turing pattern breaks symmetry', highA > devCells * 0.01 && highA < devCells * 0.9, `${highA}/${devCells}`);
+  check('growth stops at adult size', oversize === 0, `${oversize} cells past adult size`);
+
   const t0 = performance.now();
   sim.packFrame(frame);
   console.log(`      packFrame ${(performance.now() - t0).toFixed(2)} ms`);
@@ -133,7 +152,7 @@ function check(name: string, cond: boolean, detail = ''): void {
     const x = live % 256;
     const y = (live / 256) | 0;
     const info = sim.inspect(x, y);
-    check('inspect live cell', info.alive && info.genome !== null && (info.cluster?.size ?? 0) >= 1, `cluster=${info.cluster?.size}`);
+    check('inspect live cell', info.alive && info.genome !== null && (info.cluster?.size ?? 0) >= 1 && info.development !== null, `cluster=${info.cluster?.size}`);
     sim.applyTool('poke', x, y, 4, 1);
     check('poke kills centre cell', sim.somatic[live] === 0);
   }
