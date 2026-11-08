@@ -2,7 +2,7 @@
  * Shared Cloud Universe: authoritative simulation on the Railway vCPU, streamed as
  * deflate-raw keyframes + XOR deltas over a binary WebSocket.
  */
-import { FRAME_DELTA, FRAME_HEADER_BYTES, FRAME_KEY, readFrameHeader, type ClientMsg, type ServerMsg } from '../../engine/protocol';
+import { FRAME_DELTA, FRAME_HEADER_BYTES, FRAME_KEY, readFrameHeader, type ClientMsg, type ServerMsg, type WorldId } from '../../engine/protocol';
 import { fetchServerPool, inflateRaw, type ResyncResult, type SimSource, type SimSourceEvents } from './SimSource';
 
 export class CloudSource implements SimSource {
@@ -17,7 +17,7 @@ export class CloudSource implements SimSource {
   private outbox: string[] = [];
   private keyRequestedAt = 0;
 
-  constructor(private readonly ev: SimSourceEvents) {
+  constructor(private readonly ev: SimSourceEvents, private readonly world: WorldId = '2d') {
     this.connect();
   }
 
@@ -25,7 +25,7 @@ export class CloudSource implements SimSource {
     if (this.disposed) return;
     this.ev.onStatus('connecting');
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    const ws = new WebSocket(`${proto}://${location.host}/ws?world=${this.world}`);
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
     ws.onopen = () => {
@@ -75,7 +75,7 @@ export class CloudSource implements SimSource {
     const h = readFrameHeader(buf);
     if (!h) return;
     const payload = new Uint8Array(buf, FRAME_HEADER_BYTES);
-    const expected = h.width * h.height * h.layers;
+    const expected = h.width * h.height * h.depth * h.layers;
     if (h.kind === FRAME_KEY) {
       const data = await inflateRaw(payload);
       if (data.length !== expected) return this.requestKey();
@@ -101,7 +101,7 @@ export class CloudSource implements SimSource {
     } else {
       return;
     }
-    this.ev.onFrame(this.frame, h.width, h.height, h.tick);
+    this.ev.onFrame(this.frame, h.width, h.height, h.depth, h.tick);
   }
 
   send(msg: ClientMsg): void {

@@ -3,7 +3,7 @@ import type { ClientMsg, InspectResult, SimTelemetry } from '../../engine/protoc
 export type ConnectionStatus = 'connecting' | 'online' | 'offline';
 
 export interface SimSourceEvents {
-  onFrame(frame: Uint8Array, width: number, height: number, tick: number): void;
+  onFrame(frame: Uint8Array, width: number, height: number, depth: number, tick: number): void;
   onTelemetry(t: SimTelemetry): void;
   onInspect(id: number, data: InspectResult | null): void;
   onStatus(s: ConnectionStatus): void;

@@ -2,7 +2,7 @@
  * Local Sandbox Mode: offloads the simulation to a browser WebWorker whose
  * QuantumEntropyEngine is seeded from the server's latest ANU pool snapshot.
  */
-import { DEFAULT_PARAMS, type ClientMsg, type SimParams } from '../../engine/protocol';
+import { DEFAULT_PARAMS, type ClientMsg, type SimParams, type WorldId } from '../../engine/protocol';
 import { fetchServerPool, type ResyncResult, type SimSource, type SimSourceEvents } from './SimSource';
 import type { LocalInbound, LocalOutbound } from './localWorker';
 
@@ -14,7 +14,7 @@ export class LocalSource implements SimSource {
   private poolWaiters: ((p: Uint16Array) => void)[] = [];
   private lastResync = 0;
 
-  constructor(private readonly ev: SimSourceEvents, opts: { width?: number; height?: number; params?: SimParams } = {}) {
+  constructor(private readonly ev: SimSourceEvents, opts: { world?: WorldId; params?: SimParams } = {}) {
     this.worker = new Worker(new URL('./localWorker.ts', import.meta.url), { type: 'module', name: 'turinglife-sandbox' });
     this.worker.onmessage = (e: MessageEvent<LocalOutbound>) => this.onMessage(e.data);
     this.worker.onerror = (e) => ev.onNotice(`Sandbox worker error: ${e.message}`);
@@ -24,8 +24,11 @@ export class LocalSource implements SimSource {
       if (!snap) ev.onNotice('Server quantum pool unavailable — sandbox bootstrapped from local CSPRNG');
       this.post({
         type: 'init',
-        width: opts.width ?? 256,
-        height: opts.height ?? 256,
+        world: opts.world ?? '2d',
+        // The 3D sandbox is a little smaller than the cloud one so it runs smoothly on phones too.
+        width: opts.world === '3d' ? 48 : 256,
+        height: opts.world === '3d' ? 48 : 256,
+        depth: opts.world === '3d' ? 48 : 1,
         pool: snap?.pool ?? null,
         entropy: snap?.telemetry ?? null,
         params: opts.params ?? DEFAULT_PARAMS,
@@ -41,7 +44,7 @@ export class LocalSource implements SimSource {
   private onMessage(m: LocalOutbound): void {
     switch (m.type) {
       case 'frame':
-        this.ev.onFrame(new Uint8Array(m.buffer), m.width, m.height, m.tick);
+        this.ev.onFrame(new Uint8Array(m.buffer), m.width, m.height, m.depth, m.tick);
         break;
       case 'telemetry':
         this.ev.onTelemetry(m.data);

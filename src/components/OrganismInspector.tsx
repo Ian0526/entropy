@@ -78,7 +78,7 @@ export default function OrganismInspector({ data, onClose, tracking }: {
       </SectionTitle>
 
       <div className="mb-2 flex items-center justify-between text-xs">
-        <span className="font-mono text-slate-400">({data.x}, {data.y})</span>
+        <span className="font-mono text-slate-400">({data.x}, {data.y}{data.z ? `, ${data.z}` : ''})</span>
         <span className="flex items-center gap-1.5 text-slate-200">
           <span className={cx('h-2 w-2 rounded-full', SOMA_COLORS[data.somatic])} />
           {data.wall ? 'Wall terrain' : SOMA_NAMES[data.somatic]}

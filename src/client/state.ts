@@ -20,7 +20,7 @@ export interface ToolDef {
 }
 
 export const TOOLS: ToolDef[] = [
-  { id: 'inspect', label: 'Inspect / Pan', hint: 'Tap a cell to inspect · drag to pan', key: 'I', icon: Hand, accent: 'bg-slate-200 text-slate-900' },
+  { id: 'inspect', label: 'Inspect / Pan', hint: 'Tap a cell to inspect · drag to pan (2D) or orbit (3D)', key: 'I', icon: Hand, accent: 'bg-slate-200 text-slate-900' },
   { id: 'poke', label: 'Poke / Damage', hint: 'Wound tissue — watch it heal', key: 'P', icon: Zap, accent: 'bg-amber-400 text-slate-950' },
   { id: 'mutagen', label: 'Quantum Mutagen', hint: 'Irradiate genomes with quantum bit-flips', key: 'M', icon: Radiation, accent: 'bg-lime-400 text-slate-950' },
   { id: 'wall', label: 'Wall Barrier', hint: 'Draw inert terrain', key: 'B', icon: BrickWall, accent: 'bg-slate-400 text-slate-950' },

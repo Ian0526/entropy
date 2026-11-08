@@ -1,9 +1,34 @@
 import { useEffect, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, Cloud, Cpu, Dna, Layers, MessageSquareText, RotateCcw, SlidersHorizontal } from 'lucide-react';
-import { DEFAULT_PARAMS, type SimParams } from '../engine/protocol';
+import { Box, ChevronLeft, ChevronRight, Cloud, Cpu, Dna, Layers, MessageSquareText, RotateCcw, SlidersHorizontal, Square } from 'lucide-react';
+import { DEFAULT_PARAMS, type SimParams, type WorldId } from '../engine/protocol';
 import { LAYERS, type LayerWeights } from '../client/state';
 import type { SourceKind } from '../client/useSimulation';
 import { cx, Glass, Pill, SectionTitle, Slider } from './ui';
+
+export function WorldToggle({ world, setWorld, compact }: { world: WorldId; setWorld: (w: WorldId) => void; compact?: boolean }) {
+  return (
+    <div className={cx('grid grid-cols-2 gap-1 rounded-xl border border-slate-800 bg-slate-900/60 p-1', compact && 'pointer-events-auto')}>
+      {([
+        ['2d', compact ? '2D' : 'Flat world', Square, 'The original 2D petri dish (256×256)'],
+        ['3d', compact ? '3D' : 'Deep space', Box, 'A 3D void with drifting nutrient nebulae (64³)'],
+      ] as const).map(([k, label, Icon, hint]) => (
+        <button
+          key={k}
+          type="button"
+          title={hint}
+          onClick={() => setWorld(k)}
+          className={cx(
+            'flex items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-medium transition',
+            world === k ? 'bg-emerald-300 text-slate-950' : 'text-slate-400 hover:text-slate-100',
+          )}
+        >
+          <Icon size={13} />
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 export function SourceToggle({ kind, setKind }: { kind: SourceKind; setKind: (k: SourceKind) => void }) {
   return (
@@ -140,6 +165,8 @@ export function PhysicsControls({ params, onChange, onReset }: {
 
 /** Desktop left floating dock. */
 export default function ControlDrawer(props: {
+  world: WorldId;
+  setWorld: (w: WorldId) => void;
   kind: SourceKind;
   setKind: (k: SourceKind) => void;
   params: SimParams | undefined;
@@ -180,6 +207,7 @@ export default function ControlDrawer(props: {
         </div>
         {open && (
           <div className="tl-scroll min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
+            <WorldToggle world={props.world} setWorld={props.setWorld} />
             <SourceToggle kind={props.kind} setKind={props.setKind} />
             <PhysicsControls params={props.params} onChange={props.onParams} onReset={props.onReset} />
             <div>

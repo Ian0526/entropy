@@ -25,6 +25,13 @@ npm run build && npm start   # production: http://localhost:8080
 | `src/client/sim/*` | `CloudSource` (WebSocket, in-order inflate and delta apply), `LocalSource` + `localWorker` (browser sandbox seeded from the server pool, transferable frame recycling), WebGL2 renderer with a Canvas2D fallback. |
 | `src/components/*` | `SimulationCanvas`, `QuantumEntropyHUD`, `ControlDrawer`, `OrganismInspector`, `TelemetryPanel`, `ActionBar`, `MobileLayout`. |
 
+## Worlds
+
+The server runs two universes side by side, each in its own worker thread and both fed by the same quantum pool. Switch between them with **Flat world / Deep space** in the app.
+
+* **Flat world (2D):** a 256×256 torus with a 4-neighbourhood.
+* **Deep space (3D):** a 64³ 3-torus with a 6-neighbourhood: colonies floating in a dark void, feeding on drifting quantum-seeded nutrient nebulae (3D simplex clouds). It is rendered by a WebGL2 raymarcher (`src/client/sim/renderer3d.ts`): DDA voxel traversal, the food field integrated as emissive fog, and cells shaded as bevelled cubes. In the Neural layer tissue turns translucent so signal waves show through whole bodies. Resolution adapts to hold the frame rate. Drag orbits, Shift-drag or two fingers pan, wheel or pinch zooms, a tap inspects, and with a tool the brush sits on the first cell under the pointer. `GRID_3D` sets the edge (16–128, 0 disables). Frames stream at ≤ 10/s, and a world nobody watches skips frame encoding. The local sandbox runs a 48³ version in the browser.
+
 ## Physics in brief
 
 * **Cell state (SoA):** `somatic` (empty/core/armor/sensor), `energy`, `ambientFood`, `signalA` (nutrient), `signalB` (alarm), a 64-bit `genome` (2 × u32), a 2-bit `epigenetic` register (damaged/starving), plus terrain, flux and birth tick.
@@ -56,6 +63,7 @@ HTTP: `GET /health`, `GET /api/telemetry`, `GET /api/quantum/pool`, `POST /api/q
 | `BUILDER_DAILY_USD` | 20 | Builder pauses new runs after this much estimated plan usage in 24 h |
 | `BUILDER_DATA_DIR` | volume `/builder` or `./data/builder` | where Builder requests are stored (needs a Railway volume to survive redeploys) |
 | `GRID_W` / `GRID_H` | 256 | 64–1024 |
+| `GRID_3D` | 64 | edge of the cubic 3D world, 16–128; `0` disables it |
 | `QRNG_PROVIDER` | `auto` | `lfdr` \| `qrngapi` \| `anu` \| `anu-legacy` \| `none`. `auto` = `lfdr`: the keyless [LfD QRNG](https://lfdr.de/QRNG/) at OTH Regensburg (ID Quantique Quantis PCIe), 2048 bytes = a full pool every 2 min. Keyed providers must be named explicitly |
 | `LFDR_URL` | `https://lfdr.de` | override the LfD base URL |
 | `QRNGAPI_KEY` | — | qrngapi.com key (`qnrk_…`), sent as `X-API-Key` |

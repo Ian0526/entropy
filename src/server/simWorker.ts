@@ -12,30 +12,33 @@ import { QuantumEntropyEngine } from '../engine/QuantumEntropy';
 import { HDR, SimulationCore } from '../engine/SimulationCore';
 import {
   FRAME_DELTA, FRAME_HEADER_BYTES, FRAME_KEY, LAYER_COUNT, SPEED_TPS, writeFrameHeader,
-  type ClientMsg, type SimTelemetry, type SpeedMode,
+  type ClientMsg, type SimTelemetry, type SpeedMode, type WorldId,
 } from '../engine/protocol';
 import { SPEED_CODES, type WorkerInbound, type WorkerOutbound } from './workerProtocol';
 
 if (!parentPort) throw new Error('simWorker must run inside worker_threads');
 const port = parentPort;
 
-const { entropySab, gridSab, width, height } = workerData as {
+const { entropySab, gridSab, width, height, depth, world } = workerData as {
   entropySab: SharedArrayBuffer;
   gridSab: SharedArrayBuffer;
   width: number;
   height: number;
+  depth: number;
+  world: WorldId;
 };
 
 const entropy = new QuantumEntropyEngine(entropySab);
-const sim = new SimulationCore(width, height, entropy, gridSab);
+const sim = new SimulationCore(width, height, entropy, gridSab, false, depth);
 const header = sim.header;
 
-const FRAME_INTERVAL_MS = 50; //       ≤ 20 binary frames/s
+// ≤ 20 binary frames/s in 2D; the 3D volume is 2 MB raw per frame, so ≤ 10/s there.
+const FRAME_INTERVAL_MS = depth > 1 ? 100 : 50;
 const KEYFRAME_EVERY = 60; //          frames
 const TELEMETRY_MIN_MS = 150;
 const TELEMETRY_MAX_MS = 1000;
 
-const frameLen = SimulationCore.frameBytes(width, height);
+const frameLen = SimulationCore.frameBytes(width, height, depth);
 let cur = new Uint8Array(frameLen);
 let prev = new Uint8Array(frameLen);
 const xor = new Uint8Array(frameLen);
@@ -46,6 +49,7 @@ let dirty = true;
 let lastFrameAt = 0;
 let lastTelemetryAt = 0;
 let lastTelemetryTick = -1;
+let viewers = 1;
 
 const jumpTrail: number[] = [];
 let tpsEma = 0;
@@ -81,7 +85,7 @@ function emitFrame(now: number): void {
   const packet = new Uint8Array(FRAME_HEADER_BYTES + payload.length);
   writeFrameHeader(new DataView(packet.buffer), {
     kind: key ? FRAME_KEY : FRAME_DELTA,
-    width, height, layers: LAYER_COUNT,
+    width, height, depth, layers: LAYER_COUNT,
     running: Atomics.load(header, HDR.RUNNING) === 1,
     seq, tick: sim.tick,
   });
@@ -101,7 +105,8 @@ function emitTelemetry(now: number): void {
     ...sim.stats,
     topSpecies: sim.stats.topSpecies.slice(),
     source: 'cloud',
-    width, height,
+    world,
+    width, height, depth,
     tps: tpsEma,
     tickMs: tickMsEma,
     running: Atomics.load(header, HDR.RUNNING) === 1,
@@ -159,7 +164,7 @@ function loop(): void {
     ticksInWindow = 0;
     tickWindowStart = t;
   }
-  if ((dirty || keyRequested) && t - lastFrameAt >= FRAME_INTERVAL_MS) emitFrame(t);
+  if (viewers > 0 && (dirty || keyRequested) && t - lastFrameAt >= FRAME_INTERVAL_MS) emitFrame(t);
   const sinceTel = t - lastTelemetryAt;
   if ((sim.tick - lastTelemetryTick >= 10 && sinceTel >= TELEMETRY_MIN_MS) || sinceTel >= TELEMETRY_MAX_MS) emitTelemetry(t);
   Atomics.store(header, HDR.HEARTBEAT, (Date.now() / 1000) | 0);
@@ -173,7 +178,7 @@ port.on('message', (msg: WorkerInbound) => {
     case 'client': {
       const m: ClientMsg = msg.msg;
       if (m.type === 'tool') {
-        sim.applyTool(m.tool, m.x, m.y, m.radius, m.strength);
+        sim.applyTool(m.tool, m.x, m.y, m.radius, m.strength, m.z ?? 0);
         dirty = true;
       } else if (m.type === 'params') {
         sim.setParams(m.params);
@@ -185,13 +190,17 @@ port.on('message', (msg: WorkerInbound) => {
       break;
     }
     case 'inspect':
-      post({ type: 'inspect', ticket: msg.ticket, data: sim.inspect(msg.x, msg.y) });
+      post({ type: 'inspect', ticket: msg.ticket, data: sim.inspect(msg.x, msg.y, msg.z) });
       break;
     case 'needKey':
       keyRequested = true;
       break;
+    case 'viewers':
+      viewers = msg.n;
+      if (viewers > 0) keyRequested = true;
+      break;
   }
 });
 
-post({ type: 'ready', width, height });
+post({ type: 'ready', width, height, depth });
 loop();

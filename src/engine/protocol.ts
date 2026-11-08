@@ -11,7 +11,10 @@
  *   7      1     flags  (bit0 = running)
  *   8      4     sequence number (LE)
  *   12     4     simulation tick (LE)
- *   16     …     payload: `layers` planar W×H Uint8 planes (compressed for kinds 1 & 2)
+ *   16     2     depth  (LE) — 1 for the flat world
+ *   18     2     reserved
+ *   20     …     payload: `layers` planar W×H×D Uint8 planes (compressed for kinds 1 & 2),
+ *                each plane x-fastest, then y, then z
  */
 import type { EntropyTelemetry } from './QuantumEntropy';
 import type { DecodedGenome } from './Genome';
@@ -20,9 +23,12 @@ export const FRAME_MAGIC = 0x54;
 export const FRAME_KEY = 1;
 export const FRAME_DELTA = 2;
 export const FRAME_RAW = 3;
-export const FRAME_HEADER_BYTES = 16;
+export const FRAME_HEADER_BYTES = 20;
 
-/** Planar layers, each W×H bytes. */
+/** The two universes the server runs. */
+export type WorldId = '2d' | '3d';
+
+/** Planar layers, each W×H×D bytes. */
 export const LAYER = {
   STATE: 0, //    bits0-1 somatic, bit2 terrain wall, bit3 epi:damaged, bit4 epi:starving, bit5 just-born
   ENERGY: 1, //   E × 255
@@ -39,6 +45,7 @@ export interface FrameHeader {
   kind: number;
   width: number;
   height: number;
+  depth: number;
   layers: number;
   running: boolean;
   seq: number;
@@ -54,6 +61,8 @@ export function writeFrameHeader(dv: DataView, h: FrameHeader): void {
   dv.setUint8(7, h.running ? 1 : 0);
   dv.setUint32(8, h.seq >>> 0, true);
   dv.setUint32(12, h.tick >>> 0, true);
+  dv.setUint16(16, h.depth, true);
+  dv.setUint16(18, 0, true);
 }
 
 export function readFrameHeader(buf: ArrayBuffer): FrameHeader | null {
@@ -64,6 +73,7 @@ export function readFrameHeader(buf: ArrayBuffer): FrameHeader | null {
     kind: dv.getUint8(1),
     width: dv.getUint16(2, true),
     height: dv.getUint16(4, true),
+    depth: Math.max(1, dv.getUint16(16, true)),
     layers: dv.getUint8(6),
     running: (dv.getUint8(7) & 1) === 1,
     seq: dv.getUint32(8, true),
@@ -143,8 +153,10 @@ export interface SimStats {
 
 export interface SimTelemetry extends SimStats {
   source: 'cloud' | 'local';
+  world: WorldId;
   width: number;
   height: number;
+  depth: number;
   tps: number;
   tickMs: number;
   running: boolean;
@@ -164,12 +176,15 @@ export interface ClusterStats {
   meanEnergy: number;
   totalEnergy: number;
   bbox: [number, number, number, number];
+  /** [minZ, maxZ] — 0,0 in the flat world. */
+  zRange: [number, number];
   truncated: boolean;
 }
 
 export interface InspectResult {
   x: number;
   y: number;
+  z: number;
   alive: boolean;
   wall: boolean;
   somatic: number;
@@ -188,10 +203,10 @@ export interface InspectResult {
 
 /** Client → server/worker control messages (JSON). */
 export type ClientMsg =
-  | { type: 'tool'; tool: ToolKind; x: number; y: number; radius: number; strength: number }
+  | { type: 'tool'; tool: ToolKind; x: number; y: number; z?: number; radius: number; strength: number }
   | { type: 'params'; params: Partial<SimParams> }
   | { type: 'control'; running?: boolean; speed?: SpeedMode }
-  | { type: 'inspect'; id: number; x: number; y: number }
+  | { type: 'inspect'; id: number; x: number; y: number; z?: number }
   | { type: 'reset' }
   | { type: 'resync' }
   | { type: 'needKey' };
@@ -201,5 +216,5 @@ export type ServerMsg =
   | { type: 'telemetry'; data: SimTelemetry }
   | { type: 'inspect'; id: number; data: InspectResult | null }
   | { type: 'resync'; ok: boolean; cooldownMs: number; reason?: string }
-  | { type: 'hello'; width: number; height: number; layers: number }
+  | { type: 'hello'; world: WorldId; width: number; height: number; depth: number; layers: number }
   | { type: 'error'; message: string };

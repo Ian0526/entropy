@@ -1,9 +1,12 @@
 /**
- * TuringLife server — Fastify HTTP + WebSocket bridge + ANU QRNG cron.
+ * TuringLife server — Fastify HTTP + WebSocket bridge + quantum-entropy harvester.
  *
  * Main thread responsibilities (kept deliberately light so Railway health checks
  * never stall): entropy harvesting, HTTP/static serving, and fan-out of frames that
- * the simulation worker has already packed, XOR-delta'd and deflated.
+ * the simulation workers have already packed, XOR-delta'd and deflated.
+ *
+ * Two universes run side by side, each in its own worker thread and sharing the one
+ * quantum pool: the flat 2D world and the 3D world. A client picks one with /ws?world=3d.
  */
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -18,7 +21,7 @@ import { anuAqnProvider, anuLegacyProvider, lfdrProvider, qrngApiProvider, type 
 import { gridLayout, HDR } from '../engine/SimulationCore';
 import {
   DEFAULT_PARAMS, LAYER_COUNT, sanitizeParams,
-  type ClientMsg, type ServerMsg, type SimTelemetry, type SpeedMode, type ToolKind,
+  type ClientMsg, type ServerMsg, type SimTelemetry, type SpeedMode, type ToolKind, type WorldId,
 } from '../engine/protocol';
 import { SPEED_CODES, type WorkerInbound, type WorkerOutbound } from './workerProtocol';
 import { registerBuilder } from './builder/routes';
@@ -32,6 +35,8 @@ const PORT = Number(process.env.PORT ?? 8080);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const GRID_W = clampInt(process.env.GRID_W, 64, 1024, 256);
 const GRID_H = clampInt(process.env.GRID_H, 64, 1024, 256);
+/** Edge length of the cubic 3D world (cells). 0 disables it. */
+const GRID_3D = process.env.GRID_3D === '0' ? 0 : clampInt(process.env.GRID_3D, 16, 128, 64);
 const INTERVAL_ENV = process.env.QRNG_INTERVAL_MS ?? process.env.ANU_INTERVAL_MS;
 const QRNG_INTERVAL_MS = INTERVAL_ENV ? clampInt(INTERVAL_ENV, 10_000, 90 * 24 * 3600_000, 60_000) : undefined;
 const QRNG_MONTHLY = process.env.QRNG_MONTHLY_REQUESTS ? clampInt(process.env.QRNG_MONTHLY_REQUESTS, 1, 10_000_000, 10) : undefined;
@@ -48,7 +53,7 @@ function clampInt(v: string | undefined, lo: number, hi: number, d: number): num
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, bodyLimit: 16 * 1024, trustProxy: true, disableRequestLogging: true });
 const log = (m: string) => app.log.info(m);
 
-// ---- quantum entropy (shared with the worker) -------------------------------------
+// ---- quantum entropy (shared with the workers) ------------------------------------
 /**
  * QRNG_PROVIDER: auto (default) | lfdr | qrngapi | anu | anu-legacy | none
  *   auto → LfD QRNG (keyless Quantis hardware). Keyed providers must be named explicitly.
@@ -85,19 +90,11 @@ entropy.configureHarvester({
 }
 entropy.startCron();
 
-// ---- shared grid + worker supervisor ----------------------------------------------
-const gridSab = new SharedArrayBuffer(gridLayout(GRID_W, GRID_H).bytes);
-const gridHeader = new Int32Array(gridSab, 0, 16);
-Atomics.store(gridHeader, HDR.RUNNING, 1);
-Atomics.store(gridHeader, HDR.SPEED, SPEED_CODES['1x']);
-
+// ---- worlds: shared grid + worker supervisor + clients ------------------------------
 const here = fileURLToPath(import.meta.url);
 const isTs = here.endsWith('.ts');
 const workerFile = path.join(path.dirname(here), isTs ? 'simWorker.ts' : 'simWorker.js');
-
-let worker: Worker;
-let latestTelemetry: SimTelemetry | null = null;
-let workerStartedAt = Date.now();
+let shuttingDown = false;
 
 interface Client {
   ws: WebSocket;
@@ -107,87 +104,11 @@ interface Client {
   tokens: number;
   lastRefill: number;
 }
-const clients = new Set<Client>();
 let nextClientId = 1;
 let nextTicket = 1;
-const pendingInspect = new Map<number, { client: Client; id: number }>();
-let lastResetAt = 0;
 
-function spawnWorker(): void {
-  workerStartedAt = Date.now();
-  worker = new Worker(workerFile, {
-    workerData: { entropySab: entropy.sab, gridSab, width: GRID_W, height: GRID_H },
-    execArgv: isTs ? ['--import', 'tsx'] : undefined,
-  });
-  worker.on('message', onWorkerMessage);
-  worker.on('error', (err) => app.log.error({ err }, 'simulation worker crashed'));
-  worker.on('exit', (code) => {
-    if (shuttingDown) return;
-    app.log.warn(`simulation worker exited (${code}); respawning in 1s`);
-    setTimeout(spawnWorker, 1000);
-  });
-}
+const num = (v: unknown, d = 0) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
 
-function toWorker(msg: WorkerInbound): void {
-  worker.postMessage(msg);
-}
-
-function sendJson(c: Client, msg: ServerMsg): void {
-  if (c.ws.readyState === 1) c.ws.send(JSON.stringify(msg));
-}
-
-function onWorkerMessage(msg: WorkerOutbound): void {
-  switch (msg.type) {
-    case 'ready':
-      log(`simulation worker ready (${msg.width}×${msg.height})`);
-      break;
-    case 'frame': {
-      const buf = Buffer.from(msg.buffer);
-      let needKey = false;
-      for (const c of clients) {
-        if (c.ws.readyState !== 1) continue;
-        const congested = c.ws.bufferedAmount > MAX_BUFFERED;
-        if (msg.key) {
-          if (congested) {
-            c.synced = false;
-            needKey = true;
-            continue;
-          }
-          c.ws.send(buf, { binary: true });
-          c.synced = true;
-          c.lastSeq = msg.seq;
-        } else if (c.synced && !congested && c.lastSeq === ((msg.seq - 1) >>> 0)) {
-          c.ws.send(buf, { binary: true });
-          c.lastSeq = msg.seq;
-        } else {
-          // Missed a delta (backpressure or just joined): wait for the next keyframe.
-          c.synced = false;
-          needKey = true;
-        }
-      }
-      if (needKey) toWorker({ type: 'needKey' });
-      break;
-    }
-    case 'telemetry': {
-      msg.data.clients = clients.size;
-      // Provider strings/budget live on the main-thread harvester, not in shared memory.
-      msg.data.entropy = { ...msg.data.entropy, ...entropy.harvesterInfo() };
-      latestTelemetry = msg.data;
-      const json = JSON.stringify({ type: 'telemetry', data: msg.data } satisfies ServerMsg);
-      for (const c of clients) if (c.ws.readyState === 1 && c.ws.bufferedAmount < MAX_BUFFERED) c.ws.send(json);
-      break;
-    }
-    case 'inspect': {
-      const p = pendingInspect.get(msg.ticket);
-      if (!p) break;
-      pendingInspect.delete(msg.ticket);
-      sendJson(p.client, { type: 'inspect', id: p.id, data: msg.data });
-      break;
-    }
-  }
-}
-
-// ---- client message validation ---------------------------------------------------
 function takeToken(c: Client, cost = 1): boolean {
   const now = Date.now();
   c.tokens = Math.min(60, c.tokens + ((now - c.lastRefill) / 1000) * 40);
@@ -197,66 +118,183 @@ function takeToken(c: Client, cost = 1): boolean {
   return true;
 }
 
-const num = (v: unknown, d = 0) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+function sendJson(c: Client, msg: ServerMsg): void {
+  if (c.ws.readyState === 1) c.ws.send(JSON.stringify(msg));
+}
 
-async function onClientMessage(c: Client, raw: string): Promise<void> {
-  if (raw.length > 4096) return;
-  let m: ClientMsg;
-  try {
-    m = JSON.parse(raw) as ClientMsg;
-  } catch {
-    return;
+class World {
+  readonly gridSab: SharedArrayBuffer;
+  readonly header: Int32Array;
+  readonly clients = new Set<Client>();
+  latestTelemetry: SimTelemetry | null = null;
+  private worker!: Worker;
+  private startedAt = Date.now();
+  private pendingInspect = new Map<number, { client: Client; id: number }>();
+  private lastResetAt = 0;
+
+  constructor(readonly id: WorldId, readonly W: number, readonly H: number, readonly D: number) {
+    this.gridSab = new SharedArrayBuffer(gridLayout(W, H, D).bytes);
+    this.header = new Int32Array(this.gridSab, 0, 16);
+    Atomics.store(this.header, HDR.RUNNING, 1);
+    Atomics.store(this.header, HDR.SPEED, SPEED_CODES['1x']);
+    this.spawn();
   }
-  if (!m || typeof m !== 'object') return;
-  switch (m.type) {
-    case 'tool':
-      if (!TOOLS.includes(m.tool) || !takeToken(c)) return;
-      toWorker({
-        type: 'client',
-        msg: { type: 'tool', tool: m.tool, x: num(m.x), y: num(m.y), radius: num(m.radius, 3), strength: num(m.strength, 0.8) },
-      });
-      break;
-    case 'params':
-      if (!takeToken(c) || !m.params || typeof m.params !== 'object') return;
-      toWorker({ type: 'client', msg: { type: 'params', params: sanitizeParams(m.params, latestTelemetry?.params ?? DEFAULT_PARAMS) } });
-      break;
-    case 'control':
-      if (typeof m.running === 'boolean') Atomics.store(gridHeader, HDR.RUNNING, m.running ? 1 : 0);
-      if (m.speed && m.speed in SPEED_CODES) Atomics.store(gridHeader, HDR.SPEED, SPEED_CODES[m.speed as SpeedMode]);
-      break;
-    case 'inspect': {
-      if (!takeToken(c, 0.5)) return;
-      const ticket = nextTicket++;
-      pendingInspect.set(ticket, { client: c, id: num(m.id) });
-      setTimeout(() => pendingInspect.delete(ticket), 5000);
-      toWorker({ type: 'inspect', ticket, x: num(m.x), y: num(m.y) });
-      break;
-    }
-    case 'reset': {
-      const now = Date.now();
-      if (now - lastResetAt < RESET_COOLDOWN_MS) {
-        sendJson(c, { type: 'error', message: `Shared universe reset is on cooldown (${Math.ceil((RESET_COOLDOWN_MS - (now - lastResetAt)) / 1000)}s)` });
-        return;
+
+  private spawn(): void {
+    this.startedAt = Date.now();
+    this.worker = new Worker(workerFile, {
+      workerData: { entropySab: entropy.sab, gridSab: this.gridSab, width: this.W, height: this.H, depth: this.D, world: this.id },
+      execArgv: isTs ? ['--import', 'tsx'] : undefined,
+      name: `sim-${this.id}`,
+    });
+    this.worker.on('message', (m: WorkerOutbound) => this.onWorkerMessage(m));
+    this.worker.once('online', () => this.viewersChanged());
+    this.worker.on('error', (err) => app.log.error({ err }, `simulation worker (${this.id}) crashed`));
+    this.worker.on('exit', (code) => {
+      if (shuttingDown) return;
+      app.log.warn(`simulation worker (${this.id}) exited (${code}); respawning in 1s`);
+      setTimeout(() => this.spawn(), 1000);
+    });
+  }
+
+  /** Tell the worker how many clients are watching (none → it skips frame encoding). */
+  viewersChanged(): void {
+    this.toWorker({ type: 'viewers', n: this.clients.size });
+  }
+
+  toWorker(msg: WorkerInbound): void {
+    this.worker.postMessage(msg);
+  }
+
+  terminate(): Promise<number> {
+    return this.worker.terminate();
+  }
+
+  health() {
+    const beat = Atomics.load(this.header, HDR.HEARTBEAT);
+    const ageMs = beat ? Date.now() - beat * 1000 : Date.now() - this.startedAt;
+    return {
+      ok: ageMs < 15_000 || Date.now() - this.startedAt < 15_000,
+      tick: Atomics.load(this.header, HDR.TICK),
+      population: Atomics.load(this.header, HDR.POPULATION),
+      workerHeartbeatAgeMs: ageMs,
+      clients: this.clients.size,
+    };
+  }
+
+  private onWorkerMessage(msg: WorkerOutbound): void {
+    switch (msg.type) {
+      case 'ready':
+        log(`simulation worker (${this.id}) ready (${msg.width}×${msg.height}${msg.depth > 1 ? `×${msg.depth}` : ''})`);
+        break;
+      case 'frame': {
+        const buf = Buffer.from(msg.buffer);
+        let needKey = false;
+        for (const c of this.clients) {
+          if (c.ws.readyState !== 1) continue;
+          const congested = c.ws.bufferedAmount > MAX_BUFFERED;
+          if (msg.key) {
+            if (congested) {
+              c.synced = false;
+              needKey = true;
+              continue;
+            }
+            c.ws.send(buf, { binary: true });
+            c.synced = true;
+            c.lastSeq = msg.seq;
+          } else if (c.synced && !congested && c.lastSeq === ((msg.seq - 1) >>> 0)) {
+            c.ws.send(buf, { binary: true });
+            c.lastSeq = msg.seq;
+          } else {
+            // Missed a delta (backpressure or just joined): wait for the next keyframe.
+            c.synced = false;
+            needKey = true;
+          }
+        }
+        if (needKey) this.toWorker({ type: 'needKey' });
+        break;
       }
-      lastResetAt = now;
-      toWorker({ type: 'client', msg: { type: 'reset' } });
-      break;
+      case 'telemetry': {
+        msg.data.clients = this.clients.size;
+        // Provider strings/budget live on the main-thread harvester, not in shared memory.
+        msg.data.entropy = { ...msg.data.entropy, ...entropy.harvesterInfo() };
+        this.latestTelemetry = msg.data;
+        const json = JSON.stringify({ type: 'telemetry', data: msg.data } satisfies ServerMsg);
+        for (const c of this.clients) if (c.ws.readyState === 1 && c.ws.bufferedAmount < MAX_BUFFERED) c.ws.send(json);
+        break;
+      }
+      case 'inspect': {
+        const p = this.pendingInspect.get(msg.ticket);
+        if (!p) break;
+        this.pendingInspect.delete(msg.ticket);
+        sendJson(p.client, { type: 'inspect', id: p.id, data: msg.data });
+        break;
+      }
     }
-    case 'resync': {
-      const r = await entropy.forceResync();
-      sendJson(c, { type: 'resync', ...r });
-      break;
+  }
+
+  async onClientMessage(c: Client, raw: string): Promise<void> {
+    if (raw.length > 4096) return;
+    let m: ClientMsg;
+    try {
+      m = JSON.parse(raw) as ClientMsg;
+    } catch {
+      return;
     }
-    case 'needKey':
-      c.synced = false;
-      toWorker({ type: 'needKey' });
-      break;
+    if (!m || typeof m !== 'object') return;
+    switch (m.type) {
+      case 'tool':
+        if (!TOOLS.includes(m.tool) || !takeToken(c)) return;
+        this.toWorker({
+          type: 'client',
+          msg: { type: 'tool', tool: m.tool, x: num(m.x), y: num(m.y), z: num(m.z), radius: num(m.radius, 3), strength: num(m.strength, 0.8) },
+        });
+        break;
+      case 'params':
+        if (!takeToken(c) || !m.params || typeof m.params !== 'object') return;
+        this.toWorker({ type: 'client', msg: { type: 'params', params: sanitizeParams(m.params, this.latestTelemetry?.params ?? DEFAULT_PARAMS) } });
+        break;
+      case 'control':
+        if (typeof m.running === 'boolean') Atomics.store(this.header, HDR.RUNNING, m.running ? 1 : 0);
+        if (m.speed && m.speed in SPEED_CODES) Atomics.store(this.header, HDR.SPEED, SPEED_CODES[m.speed as SpeedMode]);
+        break;
+      case 'inspect': {
+        if (!takeToken(c, 0.5)) return;
+        const ticket = nextTicket++;
+        this.pendingInspect.set(ticket, { client: c, id: num(m.id) });
+        setTimeout(() => this.pendingInspect.delete(ticket), 5000);
+        this.toWorker({ type: 'inspect', ticket, x: num(m.x), y: num(m.y), z: num(m.z) });
+        break;
+      }
+      case 'reset': {
+        const now = Date.now();
+        if (now - this.lastResetAt < RESET_COOLDOWN_MS) {
+          sendJson(c, { type: 'error', message: `Shared universe reset is on cooldown (${Math.ceil((RESET_COOLDOWN_MS - (now - this.lastResetAt)) / 1000)}s)` });
+          return;
+        }
+        this.lastResetAt = now;
+        this.toWorker({ type: 'client', msg: { type: 'reset' } });
+        break;
+      }
+      case 'resync': {
+        const r = await entropy.forceResync();
+        sendJson(c, { type: 'resync', ...r });
+        break;
+      }
+      case 'needKey':
+        c.synced = false;
+        this.toWorker({ type: 'needKey' });
+        break;
+    }
   }
 }
 
-// ---- HTTP -----------------------------------------------------------------------
-let shuttingDown = false;
+const worlds = new Map<WorldId, World>();
+worlds.set('2d', new World('2d', GRID_W, GRID_H, 1));
+if (GRID_3D) worlds.set('3d', new World('3d', GRID_3D, GRID_3D, GRID_3D));
+const worldOf = (q: unknown): World => worlds.get(q === '3d' ? '3d' : '2d') ?? worlds.get('2d')!;
 
+// ---- HTTP -----------------------------------------------------------------------
 app.addHook('onSend', async (req, reply, payload) => {
   if (!reply.hasHeader('Cache-Control')) {
     // Hashed assets are immutable; the HTML shell must always revalidate so deploys take effect.
@@ -278,22 +316,23 @@ registerBuilder(app, new BuilderStore(BUILDER_DIR));
 log(`[builder] requests stored in ${BUILDER_DIR}; ${process.env.SITE_PASSWORD ? 'site password ON' : 'site open, Builder off (set SITE_PASSWORD)'}`);
 
 app.get('/health', async (_req, reply) => {
-  const beat = Atomics.load(gridHeader, HDR.HEARTBEAT);
-  const ageMs = beat ? Date.now() - beat * 1000 : Date.now() - workerStartedAt;
-  const healthy = ageMs < 15_000 || Date.now() - workerStartedAt < 15_000;
+  const per = Object.fromEntries([...worlds].map(([id, w]) => [id, w.health()]));
+  const healthy = Object.values(per).every((h) => h.ok);
+  const flat = per['2d'];
   reply.code(healthy ? 200 : 503);
   return {
     ok: healthy,
-    tick: Atomics.load(gridHeader, HDR.TICK),
-    population: Atomics.load(gridHeader, HDR.POPULATION),
-    workerHeartbeatAgeMs: ageMs,
+    tick: flat.tick,
+    population: flat.population,
+    workerHeartbeatAgeMs: flat.workerHeartbeatAgeMs,
     entropyMode: entropy.telemetry().mode,
-    clients: clients.size,
+    clients: [...worlds.values()].reduce((n, w) => n + w.clients.size, 0),
     uptimeSec: Math.round(process.uptime()),
+    worlds: per,
   };
 });
 
-app.get('/api/telemetry', async () => latestTelemetry);
+app.get<{ Querystring: { world?: string } }>('/api/telemetry', async (req) => worldOf(req.query.world).latestTelemetry);
 
 app.get('/api/quantum/pool', async (_req, reply) => {
   reply.header('Cache-Control', 'no-store');
@@ -306,17 +345,22 @@ app.post('/api/quantum/resync', async (_req, reply) => {
   return r;
 });
 
-app.get('/ws', { websocket: true }, (socket) => {
+app.get<{ Querystring: { world?: string } }>('/ws', { websocket: true }, (socket, req) => {
+  const world = worldOf(req.query.world);
   const c: Client = { ws: socket, id: nextClientId++, synced: false, lastSeq: 0, tokens: 60, lastRefill: Date.now() };
-  clients.add(c);
-  sendJson(c, { type: 'hello', width: GRID_W, height: GRID_H, layers: LAYER_COUNT });
-  if (latestTelemetry) sendJson(c, { type: 'telemetry', data: { ...latestTelemetry, clients: clients.size } });
-  toWorker({ type: 'needKey' });
+  world.clients.add(c);
+  world.viewersChanged();
+  sendJson(c, { type: 'hello', world: world.id, width: world.W, height: world.H, depth: world.D, layers: LAYER_COUNT });
+  if (world.latestTelemetry) sendJson(c, { type: 'telemetry', data: { ...world.latestTelemetry, clients: world.clients.size } });
+  world.toWorker({ type: 'needKey' });
   socket.on('message', (data: Buffer, isBinary: boolean) => {
-    if (!isBinary) void onClientMessage(c, data.toString());
+    if (!isBinary) void world.onClientMessage(c, data.toString());
   });
-  socket.on('close', () => clients.delete(c));
-  socket.on('error', () => clients.delete(c));
+  const leave = () => {
+    if (world.clients.delete(c)) world.viewersChanged();
+  };
+  socket.on('close', leave);
+  socket.on('error', leave);
 });
 
 const clientDir = path.resolve(process.cwd(), 'dist/client');
@@ -324,7 +368,7 @@ if (existsSync(clientDir)) {
   await app.register(fastifyStatic, {
     root: clientDir,
     wildcard: false,
-    cacheControl: false, // set in the onSend hook below
+    cacheControl: false, // set in the onSend hook above
   });
   app.setNotFoundHandler((req, reply) => {
     if (req.method === 'GET' && !/^\/(api|ws|assets)(\/|$)/.test(req.url)) {
@@ -337,20 +381,18 @@ if (existsSync(clientDir)) {
   app.log.warn(`no client build at ${clientDir} — run "npm run build:client" (or use the Vite dev server)`);
 }
 
-spawnWorker();
-
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   log(`${signal} received — shutting down`);
   entropy.stopCron();
-  for (const c of clients) c.ws.close(1001, 'server shutting down');
+  for (const w of worlds.values()) for (const c of w.clients) c.ws.close(1001, 'server shutting down');
   await app.close();
-  await worker.terminate();
+  await Promise.all([...worlds.values()].map((w) => w.terminate()));
   process.exit(0);
 }
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));
 
 await app.listen({ port: PORT, host: HOST });
-log(`TuringLife listening on http://${HOST}:${PORT} — grid ${GRID_W}×${GRID_H}`);
+log(`TuringLife listening on http://${HOST}:${PORT} — 2D ${GRID_W}×${GRID_H}${GRID_3D ? `, 3D ${GRID_3D}³` : ''}`);

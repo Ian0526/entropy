@@ -5,7 +5,8 @@
  * one contiguous (Shared)ArrayBuffer so the hot loops stream linearly through L1/L2
  * and the main thread can attach read-only views without copying.
  *
- * World topology: torus (W × H, wrap-around), 4-neighbourhood.
+ * World topology: torus (W × H, wrap-around) with a 4-neighbourhood, or a 3-torus
+ * (W × H × D) with a 6-neighbourhood. Cell index i = (z·H + y)·W + x.
  *
  * Tick pipeline
  *   1. absorbQuantumSeed()       quantum indeterminism enters the SFC32 sponge
@@ -17,7 +18,7 @@
  *   6. flux & statistics
  */
 import { QuantumEntropyEngine } from './QuantumEntropy';
-import { SimplexNoise2D } from './SimplexNoise';
+import { SimplexNoise2D, SimplexNoise3D } from './SimplexNoise';
 import {
   aggression, armorBias, chemoFood, chemoSignal, decodeGenome, divideThreshold, emitThreshold, gKin,
   harvestGain, kinRelation, makeAncestor, makePredator, motility, mutateInPlace, popcount32, pumpStrength,
@@ -57,6 +58,13 @@ export const ECO = {
   starvingDecay: 0.85,
   /** A cell only divides if its tile holds at least this much food (0 = off). */
   divideFoodMin: 0,
+  /** 3D nutrient clouds: base noise frequency, contrast gain, threshold, and founder colonies. */
+  cloudFreq: 0.05,
+  cloudGain: 2.6,
+  cloudCut: 0.1,
+  founders3d: 14,
+  /** Background food in the 3D void (leaner than 2D, so space reads as mostly empty). */
+  baseFood3d: 0.05,
 };
 const NOISE_CELL = 8; //             coarse food-noise lattice spacing (cells)
 const SIGNAL_A_DECAY = 0.9; //       per tick
@@ -77,8 +85,8 @@ function align(n: number, a: number): number {
   return (n + a - 1) & ~(a - 1);
 }
 
-export function gridLayout(W: number, H: number): GridLayout {
-  const N = W * H;
+export function gridLayout(W: number, H: number, D = 1): GridLayout {
+  const N = W * H * D;
   const offsets: Record<string, number> = {};
   let o = 0;
   const take = (name: string, bytes: number) => {
@@ -106,7 +114,11 @@ export function gridLayout(W: number, H: number): GridLayout {
 export class SimulationCore {
   readonly W: number;
   readonly H: number;
+  /** Depth: 1 for the flat world, > 1 for the 3D world. */
+  readonly D: number;
   readonly N: number;
+  /** Neighbours per cell: 4 (2D) or 6 (3D). The first K/2 point forward (+x, +y[, +z]). */
+  readonly K: number;
   readonly buffer: SharedArrayBuffer | ArrayBuffer;
   params: SimParams = { ...DEFAULT_PARAMS };
 
@@ -127,7 +139,7 @@ export class SimulationCore {
   readonly ancestor: Uint32Array;
 
   // ---- private scratch (never shared) -----------------------------------------
-  private readonly nbr: Int32Array; //      4 neighbours per cell: right, down, left, up
+  private readonly nbr: Int32Array; //      K neighbours per cell: +x, +y, (+z), -x, -y, (-z)
   private readonly order: Uint32Array;
   private readonly tmpA: Float32Array;
   private readonly tmpB: Float32Array;
@@ -137,6 +149,7 @@ export class SimulationCore {
   private readonly coarse: Float32Array;
   private readonly cw: number;
   private readonly ch: number;
+  private readonly cd: number;
   private visit: Uint32Array | null = null;
   private visitGen = 0;
   private queue: Int32Array | null = null;
@@ -144,21 +157,27 @@ export class SimulationCore {
   private readonly q: QuantumEntropyEngine;
   private noiseA: SimplexNoise2D;
   private noiseB: SimplexNoise2D;
+  private noiseA3: SimplexNoise3D | null = null;
+  private noiseB3: SimplexNoise3D | null = null;
   private driftAx = 0;
   private driftAy = 0;
+  private driftAz = 0;
   private driftBx = 0;
   private driftBy = 0;
+  private driftBz = 0;
   private lowPopTicks = 0;
 
   tick = 0;
   stats: SimStats;
 
-  constructor(W: number, H: number, entropy: QuantumEntropyEngine, shared?: SharedArrayBuffer | ArrayBuffer, attach = false) {
+  constructor(W: number, H: number, entropy: QuantumEntropyEngine, shared?: SharedArrayBuffer | ArrayBuffer, attach = false, D = 1) {
     this.W = W;
     this.H = H;
-    this.N = W * H;
+    this.D = Math.max(1, D | 0);
+    this.N = W * H * this.D;
+    this.K = this.D > 1 ? 6 : 4;
     this.q = entropy;
-    const L = gridLayout(W, H);
+    const L = gridLayout(W, H, this.D);
     this.buffer = shared ?? (typeof SharedArrayBuffer !== 'undefined' ? new SharedArrayBuffer(L.bytes) : new ArrayBuffer(L.bytes));
     if (this.buffer.byteLength < L.bytes) throw new Error(`grid buffer too small: ${this.buffer.byteLength} < ${L.bytes}`);
     const b = this.buffer;
@@ -179,17 +198,30 @@ export class SimulationCore {
     this.birth = new Uint32Array(b, off.birth, N);
     this.ancestor = new Uint32Array(b, off.ancestor, 2);
 
-    this.nbr = new Int32Array(N * 4);
-    for (let y = 0; y < H; y++) {
-      const yu = (y - 1 + H) % H;
-      const yd = (y + 1) % H;
-      for (let x = 0; x < W; x++) {
-        const i = y * W + x;
-        const k = i << 2;
-        this.nbr[k] = y * W + ((x + 1) % W);
-        this.nbr[k + 1] = yd * W + x;
-        this.nbr[k + 2] = y * W + ((x - 1 + W) % W);
-        this.nbr[k + 3] = yu * W + x;
+    const K = this.K;
+    const Dd = this.D;
+    this.nbr = new Int32Array(N * K);
+    const idx = (x: number, y: number, z: number) => (z * H + y) * W + x;
+    for (let z = 0; z < Dd; z++) {
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const k = idx(x, y, z) * K;
+          const xp = (x + 1) % W, xm = (x - 1 + W) % W, yp = (y + 1) % H, ym = (y - 1 + H) % H;
+          if (K === 4) {
+            this.nbr[k] = idx(xp, y, z);
+            this.nbr[k + 1] = idx(x, yp, z);
+            this.nbr[k + 2] = idx(xm, y, z);
+            this.nbr[k + 3] = idx(x, ym, z);
+          } else {
+            const zp = (z + 1) % Dd, zm = (z - 1 + Dd) % Dd;
+            this.nbr[k] = idx(xp, y, z);
+            this.nbr[k + 1] = idx(x, yp, z);
+            this.nbr[k + 2] = idx(x, y, zp);
+            this.nbr[k + 3] = idx(xm, y, z);
+            this.nbr[k + 4] = idx(x, ym, z);
+            this.nbr[k + 5] = idx(x, y, zm);
+          }
+        }
       }
     }
     this.order = new Uint32Array(N);
@@ -198,9 +230,14 @@ export class SimulationCore {
     this.dE = new Float32Array(N);
     this.cw = Math.ceil(W / NOISE_CELL);
     this.ch = Math.ceil(H / NOISE_CELL);
-    this.coarse = new Float32Array(this.cw * this.ch);
+    this.cd = this.D > 1 ? Math.ceil(this.D / NOISE_CELL) : 1;
+    this.coarse = new Float32Array(this.cw * this.ch * this.cd);
     this.noiseA = new SimplexNoise2D(entropy);
     this.noiseB = new SimplexNoise2D(entropy);
+    if (this.D > 1) {
+      this.noiseA3 = new SimplexNoise3D(entropy);
+      this.noiseB3 = new SimplexNoise3D(entropy);
+    }
     this.stats = this.emptyStats();
 
     if (!attach) this.reset();
@@ -238,6 +275,8 @@ export class SimulationCore {
     Atomics.store(this.header, HDR.TICK, 0);
     this.noiseA.reseed(q);
     this.noiseB.reseed(q);
+    this.noiseA3?.reseed(q);
+    this.noiseB3?.reseed(q);
     // Quantum symmetry breaking: drift directions of the two nutrient pocket fields.
     const a1 = q.nextFloat() * Math.PI * 2;
     const a2 = a1 + Math.PI * (0.5 + q.nextFloat());
@@ -245,13 +284,24 @@ export class SimulationCore {
     this.driftAy = Math.sin(a1) * 0.0008 * ECO.drift;
     this.driftBx = Math.cos(a2) * 0.0013 * ECO.drift;
     this.driftBy = Math.sin(a2) * 0.0013 * ECO.drift;
+    if (this.D > 1) {
+      // Tilt both drift directions out of the plane by a quantum-chosen elevation.
+      const e1 = (q.nextFloat() - 0.5) * Math.PI;
+      const e2 = (q.nextFloat() - 0.5) * Math.PI;
+      this.driftAx *= Math.cos(e1);
+      this.driftAy *= Math.cos(e1);
+      this.driftAz = Math.sin(e1) * 0.0008 * ECO.drift;
+      this.driftBx *= Math.cos(e2);
+      this.driftBy *= Math.cos(e2);
+      this.driftBz = Math.sin(e2) * 0.0013 * ECO.drift;
+    }
     this.updatePockets();
     for (let i = 0; i < this.N; i++) this.food[i] = Math.min(1, this.pocket[i] * 0.9 + 0.05);
 
     const [a0, a1w] = makeAncestor(q.nextUint32() & 0xffff);
     this.ancestor[0] = a0;
     this.ancestor[1] = a1w;
-    this.seedFounders(10);
+    this.seedFounders(this.D > 1 ? ECO.founders3d : 10);
     this.stats = this.emptyStats();
     this.refreshStats();
     this.collectSpecies();
@@ -263,7 +313,8 @@ export class SimulationCore {
     const W = this.W;
     const H = this.H;
     const picks: number[] = [];
-    const minDist = Math.max(12, Math.min(W, H) / 6);
+    const WH = W * H;
+    const minDist = Math.max(this.D > 1 ? 10 : 12, Math.min(W, H, this.D > 1 ? this.D : Infinity) / 6);
     for (let attempt = 0; attempt < 400 && picks.length < count; attempt++) {
       let best = -1;
       let bestF = -1;
@@ -276,14 +327,17 @@ export class SimulationCore {
       }
       if (best < 0) continue;
       const bx = best % W;
-      const by = (best / W) | 0;
+      const by = ((best / W) | 0) % H;
+      const bz = (best / WH) | 0;
       let ok = true;
       for (const p of picks) {
         let dx = Math.abs((p % W) - bx);
-        let dy = Math.abs(((p / W) | 0) - by);
+        let dy = Math.abs((((p / W) | 0) % H) - by);
+        let dz = Math.abs(((p / WH) | 0) - bz);
         dx = Math.min(dx, W - dx);
         dy = Math.min(dy, H - dy);
-        if (dx * dx + dy * dy < minDist * minDist) {
+        dz = Math.min(dz, this.D - dz);
+        if (dx * dx + dy * dy + dz * dz < minDist * minDist) {
           ok = false;
           break;
         }
@@ -295,22 +349,26 @@ export class SimulationCore {
       const g0 = this.ancestor[0];
       let g1 = this.ancestor[1];
       g1 = (g1 ^ (1 << (q.nextUint32() & 15)) ^ (1 << (q.nextUint32() & 15))) >>> 0;
-      this.stampDisk(p % W, (p / W) | 0, 3, g0, g1, 0.7, false);
+      this.stampDisk(p % W, ((p / W) | 0) % H, 3, g0, g1, 0.7, false, (p / WH) | 0);
     }
   }
 
   /** Write a disk of fresh cells sharing a genome (mutated lightly per cell). */
-  private stampDisk(cx: number, cy: number, r: number, g0: number, g1: number, e: number, predator: boolean): number {
+  /** A disk (2D) or ball (3D) of founder cells centred on (cx, cy, cz). */
+  private stampDisk(cx: number, cy: number, r: number, g0: number, g1: number, e: number, predator: boolean, cz = 0): number {
     const q = this.q;
     let placed = 0;
+    const rz = this.D > 1 ? r : 0;
+    for (let dz = -rz; dz <= rz; dz++)
     for (let dy = -r; dy <= r; dy++) {
       for (let dx = -r; dx <= r; dx++) {
-        if (dx * dx + dy * dy > r * r) continue;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > r * r) continue;
         const x = (cx + dx + this.W) % this.W;
         const y = (cy + dy + this.H) % this.H;
-        const i = y * this.W + x;
+        const z = (cz + dz + this.D) % this.D;
+        const i = (z * this.H + y) * this.W + x;
         if (this.terrain[i]) continue;
-        const d2 = dx * dx + dy * dy;
         this.somatic[i] = d2 >= (r - 1) * (r - 1)
           ? (predator || q.nextFloat() < 0.5 ? SOMA.SENSOR : SOMA.ARMOR)
           : SOMA.CORE;
@@ -344,7 +402,65 @@ export class SimulationCore {
     return (1 - u) * (1 - v) * a + u * (1 - v) * b + (1 - u) * v * c + u * v * d;
   }
 
+  private sampleTileable3(n: SimplexNoise3D, x: number, y: number, z: number, pw: number, ph: number, pd: number, f: number, ox: number, oy: number, oz: number): number {
+    // Trilinear blend of eight offset samples → seamless on the 3-torus.
+    const u = x / pw;
+    const v = y / ph;
+    const w = z / pd;
+    const X0 = (x + ox) * f, X1 = (x - pw + ox) * f;
+    const Y0 = (y + oy) * f, Y1 = (y - ph + oy) * f;
+    const Z0 = (z + oz) * f, Z1 = (z - pd + oz) * f;
+    const a = (1 - u) * n.noise(X0, Y0, Z0) + u * n.noise(X1, Y0, Z0);
+    const b = (1 - u) * n.noise(X0, Y1, Z0) + u * n.noise(X1, Y1, Z0);
+    const c = (1 - u) * n.noise(X0, Y0, Z1) + u * n.noise(X1, Y0, Z1);
+    const d = (1 - u) * n.noise(X0, Y1, Z1) + u * n.noise(X1, Y1, Z1);
+    return (1 - w) * ((1 - v) * a + v * b) + w * ((1 - v) * c + v * d);
+  }
+
+  /** 3D nutrient clouds: drifting quantum-seeded simplex nebulae on a coarse lattice, trilinearly upsampled. */
+  private updatePockets3(): void {
+    const { cw, ch, cd, W, H, D } = this;
+    const pw = cw * NOISE_CELL, ph = ch * NOISE_CELL, pd = cd * NOISE_CELL;
+    const t = this.tick;
+    const nA = this.noiseA3!;
+    const nB = this.noiseB3!;
+    const c = this.coarse;
+    for (let cz = 0; cz < cd; cz++) {
+      for (let cy = 0; cy < ch; cy++) {
+        for (let cx = 0; cx < cw; cx++) {
+          const x = cx * NOISE_CELL, y = cy * NOISE_CELL, z = cz * NOISE_CELL;
+          const n1 = this.sampleTileable3(nA, x, y, z, pw, ph, pd, ECO.cloudFreq, t * this.driftAx * 60, t * this.driftAy * 60, t * this.driftAz * 60);
+          const n2 = this.sampleTileable3(nB, x, y, z, pw, ph, pd, ECO.cloudFreq * 2.3, t * this.driftBx * 60, t * this.driftBy * 60, t * this.driftBz * 60);
+          let v = (n1 * 0.7 + n2 * 0.3) * ECO.cloudGain - ECO.cloudCut;
+          v = v < 0 ? 0 : v > 1 ? 1 : v;
+          c[(cz * ch + cy) * cw + cx] = v * Math.sqrt(v);
+        }
+      }
+    }
+    const inv = 1 / NOISE_CELL;
+    const pocket = this.pocket;
+    let i = 0;
+    for (let z = 0; z < D; z++) {
+      const fz = z * inv, z0 = Math.floor(fz) % cd, z1 = (z0 + 1) % cd, tz = fz - Math.floor(fz);
+      for (let y = 0; y < H; y++) {
+        const fy = y * inv, y0 = Math.floor(fy) % ch, y1 = (y0 + 1) % ch, ty = fy - Math.floor(fy);
+        const r00 = (z0 * ch + y0) * cw, r01 = (z0 * ch + y1) * cw, r10 = (z1 * ch + y0) * cw, r11 = (z1 * ch + y1) * cw;
+        for (let x = 0; x < W; x++, i++) {
+          const fx = x * inv, x0 = Math.floor(fx) % cw, x1 = (x0 + 1) % cw, tx = fx - Math.floor(fx);
+          const a = c[r00 + x0] + (c[r00 + x1] - c[r00 + x0]) * tx;
+          const b = c[r01 + x0] + (c[r01 + x1] - c[r01 + x0]) * tx;
+          const e = c[r10 + x0] + (c[r10 + x1] - c[r10 + x0]) * tx;
+          const f = c[r11 + x0] + (c[r11 + x1] - c[r11 + x0]) * tx;
+          const lo = a + (b - a) * ty;
+          const hi = e + (f - e) * ty;
+          pocket[i] = lo + (hi - lo) * tz;
+        }
+      }
+    }
+  }
+
   private updatePockets(): void {
+    if (this.D > 1) return this.updatePockets3();
     const cw = this.cw;
     const ch = this.ch;
     const pw = cw * NOISE_CELL;
@@ -394,6 +510,7 @@ export class SimulationCore {
     const food = this.food;
     const pocket = this.pocket;
     const terrain = this.terrain;
+    const base = this.D > 1 ? ECO.baseFood3d : ECO.baseFood;
     for (let i = 0; i < this.N; i++) {
       if (terrain[i]) {
         food[i] = 0;
@@ -401,7 +518,7 @@ export class SimulationCore {
       }
       const f = food[i];
       // Logistic regrowth inside pockets, slow evaporation outside them.
-      food[i] = f + regen * (ECO.baseFood + (1 - ECO.baseFood) * pocket[i]) * (1 - f) - f * ECO.evaporation;
+      food[i] = f + regen * (base + (1 - base) * pocket[i]) * (1 - f) - f * ECO.evaporation;
     }
   }
 
@@ -409,27 +526,27 @@ export class SimulationCore {
   // Signal propagation: relay waves through living tissue, `signalSpeed` hops per tick
   // ===========================================================================
 
-  private propagateSignals(): void {
+  /**
+   * Relay waves only travel through living tissue, so the sub-steps visit just the live cells
+   * (`live[0..m)`), Jacobi-style. Signal left in the void bleeds out at 0.4 per sub-step.
+   */
+  private propagateSignals(live: Uint32Array, m: number): void {
     const steps = this.params.signalSpeed;
+    const K = this.K;
     const N = this.N;
     const nbr = this.nbr;
     const som = this.somatic;
-    let a = this.sigA;
-    let b = this.sigB;
-    let na = this.tmpA;
-    let nb = this.tmpB;
+    const a = this.sigA;
+    const b = this.sigB;
+    const na = this.tmpA;
+    const nb = this.tmpB;
     for (let s = 0; s < steps; s++) {
-      for (let i = 0; i < N; i++) {
-        if (som[i] === 0) {
-          // Signals cannot travel through the void; they bleed out quickly.
-          na[i] = a[i] * 0.4;
-          nb[i] = b[i] * 0.4;
-          continue;
-        }
-        const k = i << 2;
+      for (let q = 0; q < m; q++) {
+        const i = live[q];
+        const k = i * K;
         let ma = a[i];
         let mb = b[i];
-        for (let d = 0; d < 4; d++) {
+        for (let d = 0; d < K; d++) {
           const j = nbr[k + d];
           if (som[j] === 0) continue;
           const va = a[j] * SIGNAL_HOP;
@@ -440,17 +557,26 @@ export class SimulationCore {
         na[i] = ma;
         nb[i] = mb;
       }
-      let t = a; a = na; na = t;
-      t = b; b = nb; nb = t;
+      for (let q = 0; q < m; q++) {
+        const i = live[q];
+        a[i] = na[i];
+        b[i] = nb[i];
+      }
     }
-    // Ensure the persistent fields hold the result, then apply per-tick decay.
-    if (a !== this.sigA) this.sigA.set(a);
-    if (b !== this.sigB) this.sigB.set(b);
-    const A = this.sigA;
-    const B = this.sigB;
+    // Per-tick decay; the void also loses 0.4 per sub-step. Tiny values are flushed to zero
+    // (decaying Float32s would otherwise become denormals, which are very slow).
+    const bleed = Math.pow(0.4, steps);
+    const voidA = SIGNAL_A_DECAY * bleed;
+    const voidB = SIGNAL_B_DECAY * bleed;
     for (let i = 0; i < N; i++) {
-      A[i] *= SIGNAL_A_DECAY;
-      B[i] *= SIGNAL_B_DECAY;
+      const va = a[i];
+      const vb = b[i];
+      if (va === 0 && vb === 0) continue;
+      const live = som[i] !== 0;
+      const x = va * (live ? SIGNAL_A_DECAY : voidA);
+      const y = vb * (live ? SIGNAL_B_DECAY : voidB);
+      a[i] = x < 1e-4 ? 0 : x;
+      b[i] = y < 1e-4 ? 0 : y;
     }
   }
 
@@ -459,9 +585,10 @@ export class SimulationCore {
   // ===========================================================================
 
   private kinNeighbours(n: number, kin: number, exclude: number): number {
-    const k = n << 2;
+    const K = this.K;
+    const k = n * K;
     let c = 0;
-    for (let d = 0; d < 4; d++) {
+    for (let d = 0; d < K; d++) {
       const j = this.nbr[k + d];
       if (j !== exclude && this.somatic[j] !== 0 && kinRelation(kin, this.genome[j * 2 + 1] & 0xffff) < 2) c++;
     }
@@ -506,7 +633,6 @@ export class SimulationCore {
     this.stats.predations = 0;
 
     this.regenerateFood();
-    this.propagateSignals();
 
     const N = this.N;
     const som = this.somatic;
@@ -520,6 +646,7 @@ export class SimulationCore {
     const nbr = this.nbr;
     const birth = this.birth;
     const P = this.params;
+    const K = this.K;
     const phaseP = 1 - Math.exp(-P.phaseRate);
     const decayMul = P.metabolicDecay;
     const mu = P.mutationRate;
@@ -528,6 +655,7 @@ export class SimulationCore {
     const order = this.order;
     let m = 0;
     for (let i = 0; i < N; i++) if (som[i] !== 0) order[m++] = i;
+    this.propagateSignals(order, m);
     for (let k = m - 1; k > 0; k--) {
       const j = q.nextInt(k + 1);
       const t = order[k];
@@ -552,7 +680,7 @@ export class SimulationCore {
 
       // -- Poisson phase clock: does this cell act during this tick?
       if (q.nextFloat() < phaseP) {
-        const nk = i << 2;
+        const nk = i * K;
 
         // -- 2. harvest
         const hg = HARVEST[t] * harvestGain(w0) * (starving ? 1.2 : 1);
@@ -561,7 +689,7 @@ export class SimulationCore {
           food[i] -= h;
           e += h * HARVEST_EFFICIENCY;
           // "Mouth" edges also graze one adjacent open tile, feeding the body via routing.
-          const g = nbr[nk + (q.nextUint32() & 3)];
+          const g = nbr[nk + (q.nextUint32() % K)];
           if (som[g] === 0 && terrain[g] === 0) {
             const hn = food[g] * hg * 0.6;
             food[g] -= hn;
@@ -584,7 +712,7 @@ export class SimulationCore {
         // -- 4. predation on a random neighbour
         const agr = aggression(w1);
         const r = q.nextUint32();
-        const target = nbr[nk + (r & 3)];
+        const target = nbr[nk + (r % K)];
         if (agr > 0.05 && som[target] !== 0 && ((r >>> 2) & 1023) < agr * 1024) {
           const tk = genome[target * 2 + 1] & 0xffff;
           if (kinRelation(kin, tk) === 2) {
@@ -608,7 +736,7 @@ export class SimulationCore {
         if (e > divideThreshold(w0) + REPLICATION_COST && food[i] >= ECO.divideFoodMin) {
           let best = -1;
           let bestScore = -1e9;
-          for (let d = 0; d < 4; d++) {
+          for (let d = 0; d < K; d++) {
             const n = nbr[nk + d];
             if (som[n] !== 0 || terrain[n] !== 0) continue;
             const score = cf * (food[n] - food[i]) * 4 + cs * (sigA[n] - sigA[i]) * 2
@@ -655,7 +783,7 @@ export class SimulationCore {
           if (mot > 0 && q.nextFloat() < mot * 0.25) {
             let best = -1;
             let bestGain = 0.01;
-            for (let d = 0; d < 4; d++) {
+            for (let d = 0; d < K; d++) {
               const n = nbr[nk + d];
               if (som[n] !== 0 || terrain[n] !== 0) continue;
               const gain = cf * (food[n] - food[i]) + cs * (sigA[n] - sigA[i]) * 0.5;
@@ -712,6 +840,8 @@ export class SimulationCore {
     const sigB = this.sigB;
     const nbr = this.nbr;
     const dE = this.dE;
+    const K = this.K;
+    const FWD = K >> 1; // forward neighbours only, so each pair is visited once
     dE.fill(0);
     for (let i = 0; i < N; i++) {
       if (som[i] === 0) continue;
@@ -719,8 +849,8 @@ export class SimulationCore {
       const ki = wi & 0xffff;
       const pi = pumpStrength(wi);
       const ei = energy[i];
-      for (let d = 0; d < 2; d++) {
-        const j = nbr[(i << 2) + d];
+      for (let d = 0; d < FWD; d++) {
+        const j = nbr[i * K + d];
         if (som[j] === 0) continue;
         const wj = genome[j * 2 + 1];
         if (kinRelation(ki, wj & 0xffff) === 2) continue;
@@ -869,26 +999,30 @@ export class SimulationCore {
   // Perturbation tools
   // ===========================================================================
 
-  applyTool(tool: ToolKind, cx: number, cy: number, radius: number, strength: number): void {
+  applyTool(tool: ToolKind, cx: number, cy: number, radius: number, strength: number, cz = 0): void {
     const q = this.q;
     const W = this.W;
     const H = this.H;
+    const D = this.D;
     cx = Math.floor(((cx % W) + W) % W);
     cy = Math.floor(((cy % H) + H) % H);
+    cz = Math.floor((((Number.isFinite(cz) ? cz : 0) % D) + D) % D);
     const r = Math.max(0, Math.min(32, Math.round(radius)));
     strength = Math.max(0, Math.min(1, strength));
     if (tool === 'inspect') return;
     if (tool === 'predator') {
       const [p0, p1] = makePredator(q.nextUint32() & 0xffff);
-      this.stampDisk(cx, cy, Math.max(2, Math.min(r, 4)), p0, p1, 0.85, true);
+      this.stampDisk(cx, cy, Math.max(2, Math.min(r, 4)), p0, p1, 0.85, true, cz);
       return;
     }
+    const rz = D > 1 ? Math.min(r, 16) : 0;
+    for (let dz = -rz; dz <= rz; dz++)
     for (let dy = -r; dy <= r; dy++) {
       for (let dx = -r; dx <= r; dx++) {
-        const d2 = dx * dx + dy * dy;
+        const d2 = dx * dx + dy * dy + dz * dz;
         if (d2 > r * r) continue;
         const falloff = r > 0 ? 1 - Math.sqrt(d2) / (r + 1) : 1;
-        const i = ((cy + dy + H) % H) * W + ((cx + dx + W) % W);
+        const i = (((((cz + dz) % D) + D) % D) * H + ((cy + dy + H) % H)) * W + ((cx + dx + W) % W);
         switch (tool) {
           case 'poke': {
             if (this.somatic[i] === 0) break;
@@ -933,19 +1067,21 @@ export class SimulationCore {
   // Inspection
   // ===========================================================================
 
-  inspect(x: number, y: number): InspectResult {
+  inspect(x: number, y: number, z = 0): InspectResult {
     const W = this.W;
     const H = this.H;
+    const D = this.D;
     x = Math.floor(((x % W) + W) % W);
     y = Math.floor(((y % H) + H) % H);
-    const i = y * W + x;
+    z = Math.floor((((Number.isFinite(z) ? z : 0) % D) + D) % D);
+    const i = (z * H + y) * W + x;
     const alive = this.somatic[i] !== 0;
     const w0 = this.genome[i * 2];
     const w1 = this.genome[i * 2 + 1];
     const dist = alive ? popcount32(w0 ^ this.ancestor[0]) + popcount32(w1 ^ this.ancestor[1]) : 0;
     const rel = kinRelation(gKin(w1), gKin(this.ancestor[1]));
     return {
-      x, y, alive,
+      x, y, z, alive,
       wall: this.terrain[i] !== 0,
       somatic: this.somatic[i],
       energy: this.energy[i],
@@ -989,6 +1125,10 @@ export class SimulationCore {
     let minY = Infinity;
     let maxX = -Infinity;
     let maxY = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    const K = this.K;
+    const WH = this.W * this.H;
     let truncated = false;
     while (head < tail) {
       const c = queue[head++];
@@ -998,13 +1138,16 @@ export class SimulationCore {
       else sensor++;
       sumE += this.energy[c];
       const cx = c % this.W;
-      const cy = (c / this.W) | 0;
+      const cy = ((c / this.W) | 0) % this.H;
+      const cz = (c / WH) | 0;
+      if (cz < minZ) minZ = cz;
+      if (cz > maxZ) maxZ = cz;
       if (cx < minX) minX = cx;
       if (cy < minY) minY = cy;
       if (cx > maxX) maxX = cx;
       if (cy > maxY) maxY = cy;
-      for (let d = 0; d < 4; d++) {
-        const n = this.nbr[(c << 2) + d];
+      for (let d = 0; d < K; d++) {
+        const n = this.nbr[c * K + d];
         if (visit[n] === gen || this.somatic[n] === 0) continue;
         if (kinRelation(kin, this.genome[n * 2 + 1] & 0xffff) === 2) continue;
         visit[n] = gen;
@@ -1021,6 +1164,7 @@ export class SimulationCore {
       meanEnergy: size ? sumE / size : 0,
       totalEnergy: sumE,
       bbox: [minX, minY, maxX, maxY],
+      zRange: [minZ, maxZ],
       truncated,
     };
   }
@@ -1029,8 +1173,8 @@ export class SimulationCore {
   // Frame packing (planar quantised layers for rendering & streaming)
   // ===========================================================================
 
-  static frameBytes(W: number, H: number): number {
-    return W * H * LAYER_COUNT;
+  static frameBytes(W: number, H: number, D = 1): number {
+    return W * H * D * LAYER_COUNT;
   }
 
   packFrame(out: Uint8Array): void {

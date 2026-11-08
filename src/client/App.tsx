@@ -3,7 +3,8 @@ import type { InspectResult, SimParams, SpeedMode, ToolKind } from '../engine/pr
 import { useSimulation } from './useSimulation';
 import { TOOLS, type LayerWeights } from './state';
 import SimulationCanvas from '../components/SimulationCanvas';
-import ControlDrawer, { BlendSliders, LayerToggles, PhysicsControls, SourceToggle } from '../components/ControlDrawer';
+import SimulationCanvas3D from '../components/SimulationCanvas3D';
+import ControlDrawer, { BlendSliders, LayerToggles, PhysicsControls, SourceToggle, WorldToggle } from '../components/ControlDrawer';
 import QuantumEntropyHUD from '../components/QuantumEntropyHUD';
 import OrganismInspector from '../components/OrganismInspector';
 import TelemetryPanel from '../components/TelemetryPanel';
@@ -19,7 +20,7 @@ export default function App() {
   const [strength, setStrength] = useState(0.8);
   const [layers, setLayers] = useState<LayerWeights>([1, 0, 0, 0]);
   const [fps, setFps] = useState(0);
-  const [selected, setSelected] = useState<{ x: number; y: number } | null>(null);
+  const [selected, setSelected] = useState<{ x: number; y: number; z: number } | null>(null);
   const [inspectData, setInspectData] = useState<InspectResult | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [sheetTab, setSheetTab] = useState<SheetTab>('physics');
@@ -48,13 +49,13 @@ export default function App() {
   const runningRef = useRef(running);
   runningRef.current = running;
 
-  const onPaint = useCallback((x: number, y: number) => {
-    sim.send({ type: 'tool', tool, x, y, radius: brushRadius, strength });
+  const onPaint = useCallback((x: number, y: number, z = 0) => {
+    sim.send({ type: 'tool', tool, x, y, z, radius: brushRadius, strength });
   }, [sim, tool, brushRadius, strength]);
 
-  const onInspect = useCallback(async (x: number, y: number) => {
-    setSelected({ x, y });
-    const d = await sim.inspect(x, y);
+  const onInspect = useCallback(async (x: number, y: number, z = 0) => {
+    setSelected({ x, y, z });
+    const d = await sim.inspect(x, y, z);
     setInspectData(d);
     if (window.matchMedia('(max-width: 1023px)').matches) {
       setSheetTab('inspector');
@@ -66,7 +67,7 @@ export default function App() {
   useEffect(() => {
     if (!selected) return;
     const id = setInterval(async () => {
-      const d = await sim.inspect(selected.x, selected.y);
+      const d = await sim.inspect(selected.x, selected.y, selected.z);
       if (d) setInspectData(d);
     }, 1000);
     return () => clearInterval(id);
@@ -76,7 +77,7 @@ export default function App() {
   useEffect(() => {
     setSelected(null);
     setInspectData(null);
-  }, [sim.kind]);
+  }, [sim.kind, sim.world]);
 
   // Hotkeys.
   useEffect(() => {
@@ -133,22 +134,38 @@ export default function App() {
 
   return (
     <div className="relative h-[100dvh] w-[100dvw] overflow-hidden bg-[#02040b] text-slate-200">
-      <SimulationCanvas
-        frameRef={sim.frameRef}
-        layers={layers}
-        tool={tool}
-        brushRadius={brushRadius}
-        selected={selected}
-        onPaint={onPaint}
-        onInspect={onInspect}
-        onFps={setFps}
-      />
+      {sim.world === '3d' ? (
+        <SimulationCanvas3D
+          key={`3d-${sim.kind}`}
+          frameRef={sim.frameRef}
+          layers={layers}
+          tool={tool}
+          brushRadius={brushRadius}
+          selected={selected}
+          onPaint={onPaint}
+          onInspect={onInspect}
+          onFps={setFps}
+          onUnsupported={() => sim.setWorld('2d')}
+        />
+      ) : (
+        <SimulationCanvas
+          key={`2d-${sim.kind}`}
+          frameRef={sim.frameRef}
+          layers={layers}
+          tool={tool}
+          brushRadius={brushRadius}
+          selected={selected}
+          onPaint={onPaint}
+          onInspect={onInspect}
+          onFps={setFps}
+        />
+      )}
 
       {sim.status !== 'online' && (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
           <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-4 py-2 text-sm text-slate-300 backdrop-blur">
             {sim.status === 'connecting'
-              ? sim.kind === 'cloud' ? 'Connecting to the shared cloud universe…' : 'Booting local sandbox…'
+              ? sim.kind === 'cloud' ? `Connecting to the shared ${sim.world === '3d' ? '3D' : '2D'} universe…` : 'Booting local sandbox…'
               : 'Connection lost — reconnecting…'}
           </div>
         </div>
@@ -163,6 +180,8 @@ export default function App() {
       <ControlDrawer
         kind={sim.kind}
         setKind={sim.setKind}
+        world={sim.world}
+        setWorld={sim.setWorld}
         params={t?.params}
         onParams={onParams}
         onReset={onReset}
@@ -197,6 +216,7 @@ export default function App() {
       <MobileToolbar onOpenSheet={() => setSheetOpen(true)}>
         <div className="tl-scroll flex items-center gap-2 overflow-x-auto pb-1">
           <PlayButton running={running} onToggle={() => setRunning(!running)} />
+          <WorldToggle world={sim.world} setWorld={sim.setWorld} compact />
           <ToolPalette tool={tool} setTool={setTool} size="sm" />
         </div>
         <div className="tl-scroll mt-1.5 overflow-x-auto">
@@ -206,6 +226,7 @@ export default function App() {
       <BottomSheet open={sheetOpen} setOpen={setSheetOpen} tab={sheetTab} setTab={setSheetTab}>
         {sheetTab === 'physics' && (
           <div className="space-y-4">
+            <WorldToggle world={sim.world} setWorld={sim.setWorld} />
             <SourceToggle kind={sim.kind} setKind={sim.setKind} />
             <div className="flex items-center justify-between gap-2">
               <SpeedControl speed={speed} setSpeed={setSpeed} />

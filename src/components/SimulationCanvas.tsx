@@ -87,7 +87,7 @@ export default function SimulationCanvas(props: Props) {
     const loop = () => {
       raf = requestAnimationFrame(loop);
       const fs = propsRef.current.frameRef.current;
-      if (fs.version !== lastVersion && fs.data) {
+      if (fs.version !== lastVersion && fs.data && fs.depth <= 1) {
         lastVersion = fs.version;
         if (fs.width !== gridW || fs.height !== gridH) {
           gridW = fs.width;

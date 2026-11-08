@@ -6,18 +6,18 @@
  */
 import { QuantumEntropyEngine } from '../../engine/QuantumEntropy';
 import { SimulationCore } from '../../engine/SimulationCore';
-import { SPEED_TPS, type ClientMsg, type SimParams, type SimTelemetry, type SpeedMode } from '../../engine/protocol';
+import { SPEED_TPS, type ClientMsg, type SimParams, type SimTelemetry, type SpeedMode, type WorldId } from '../../engine/protocol';
 import type { EntropyTelemetry } from '../../engine/QuantumEntropy';
 
 export type LocalInbound =
-  | { type: 'init'; width: number; height: number; pool: Uint16Array | null; entropy: EntropyTelemetry | null; params: SimParams }
+  | { type: 'init'; world: WorldId; width: number; height: number; depth: number; pool: Uint16Array | null; entropy: EntropyTelemetry | null; params: SimParams }
   | { type: 'client'; msg: ClientMsg }
   | { type: 'seedPool'; pool: Uint16Array; entropy: EntropyTelemetry | null }
   | { type: 'recycle'; buffer: ArrayBuffer }
   | { type: 'getPool' };
 
 export type LocalOutbound =
-  | { type: 'frame'; buffer: ArrayBuffer; width: number; height: number; tick: number }
+  | { type: 'frame'; buffer: ArrayBuffer; width: number; height: number; depth: number; tick: number }
   | { type: 'telemetry'; data: SimTelemetry }
   | { type: 'inspect'; id: number; data: ReturnType<SimulationCore['inspect']> }
   | { type: 'pool'; pool: Uint16Array };
@@ -28,6 +28,7 @@ let sim: SimulationCore | null = null;
 let entropy: QuantumEntropyEngine | null = null;
 let running = true;
 let speed: SpeedMode = '1x';
+let world: WorldId = '2d';
 const spare: ArrayBuffer[] = [];
 let frameBytes = 0;
 let dirty = true;
@@ -63,7 +64,7 @@ function emitFrame(now: number): void {
   if (!sim) return;
   const buf = spare.pop() ?? new ArrayBuffer(frameBytes);
   sim.packFrame(new Uint8Array(buf));
-  post({ type: 'frame', buffer: buf, width: sim.W, height: sim.H, tick: sim.tick }, [buf]);
+  post({ type: 'frame', buffer: buf, width: sim.W, height: sim.H, depth: sim.D, tick: sim.tick }, [buf]);
   lastFrame = now;
   dirty = false;
 }
@@ -76,8 +77,10 @@ function emitTelemetry(now: number): void {
       ...sim.stats,
       topSpecies: sim.stats.topSpecies.slice(),
       source: 'local',
+      world,
       width: sim.W,
       height: sim.H,
+      depth: sim.D,
       tps: tpsEma,
       tickMs: tickMsEma,
       running,
@@ -138,9 +141,10 @@ ctx.onmessage = (e: MessageEvent<LocalInbound>) => {
     case 'init': {
       entropy = new QuantumEntropyEngine();
       seed(m.pool, m.entropy);
-      sim = new SimulationCore(m.width, m.height, entropy);
+      world = m.world;
+      sim = new SimulationCore(m.width, m.height, entropy, undefined, false, m.depth);
       sim.setParams(m.params);
-      frameBytes = SimulationCore.frameBytes(m.width, m.height);
+      frameBytes = SimulationCore.frameBytes(m.width, m.height, m.depth);
       lastLoop = performance.now();
       emitTelemetry(lastLoop);
       loop();
@@ -158,14 +162,14 @@ ctx.onmessage = (e: MessageEvent<LocalInbound>) => {
     case 'client': {
       if (!sim) break;
       const c = m.msg;
-      if (c.type === 'tool') sim.applyTool(c.tool, c.x, c.y, c.radius, c.strength);
+      if (c.type === 'tool') sim.applyTool(c.tool, c.x, c.y, c.radius, c.strength, c.z ?? 0);
       else if (c.type === 'params') sim.setParams(c.params);
       else if (c.type === 'control') {
         if (typeof c.running === 'boolean') running = c.running;
         if (c.speed) speed = c.speed;
         emitTelemetry(performance.now());
       } else if (c.type === 'reset') sim.reset();
-      else if (c.type === 'inspect') post({ type: 'inspect', id: c.id, data: sim.inspect(c.x, c.y) });
+      else if (c.type === 'inspect') post({ type: 'inspect', id: c.id, data: sim.inspect(c.x, c.y, c.z ?? 0) });
       dirty = true;
       break;
     }

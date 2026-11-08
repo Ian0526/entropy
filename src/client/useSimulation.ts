@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ClientMsg, InspectResult, SimTelemetry } from '../engine/protocol';
+import type { ClientMsg, InspectResult, SimTelemetry, WorldId } from '../engine/protocol';
 import { CloudSource } from './sim/CloudSource';
 import { LocalSource } from './sim/LocalSource';
 import type { ConnectionStatus, ResyncResult, SimSource, SimSourceEvents } from './sim/SimSource';
@@ -11,6 +11,7 @@ export interface FrameStore {
   data: Uint8Array | null;
   width: number;
   height: number;
+  depth: number;
   tick: number;
   version: number;
 }
@@ -28,11 +29,13 @@ const emptyHistory = (): History => ({ population: [], species: [], energy: [], 
 export function useSimulation() {
   const [kind, setKind] = useState<SourceKind>(() =>
     (typeof localStorage !== 'undefined' && localStorage.getItem('turinglife.source') === 'local') ? 'local' : 'cloud');
+  const [world, setWorld] = useState<WorldId>(() =>
+    (typeof localStorage !== 'undefined' && localStorage.getItem('turinglife.world') === '3d') ? '3d' : '2d');
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [telemetry, setTelemetry] = useState<SimTelemetry | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [history, setHistory] = useState<History>(emptyHistory);
-  const frameRef = useRef<FrameStore>({ data: null, width: 0, height: 0, tick: 0, version: 0 });
+  const frameRef = useRef<FrameStore>({ data: null, width: 0, height: 0, depth: 1, tick: 0, version: 0 });
   const sourceRef = useRef<SimSource | null>(null);
   const telemetryRef = useRef<SimTelemetry | null>(null);
   const waiters = useRef(new Map<number, (r: InspectResult | null) => void>());
@@ -41,19 +44,21 @@ export function useSimulation() {
 
   useEffect(() => {
     localStorage.setItem('turinglife.source', kind);
-    frameRef.current = { data: null, width: 0, height: 0, tick: 0, version: frameRef.current.version + 1 };
+    localStorage.setItem('turinglife.world', world);
+    frameRef.current = { data: null, width: 0, height: 0, depth: 1, tick: 0, version: frameRef.current.version + 1 };
     lastHistTick.current = -1;
     setHistory(emptyHistory());
     setTelemetry(null);
 
     let src: SimSource | null = null;
     const ev: SimSourceEvents = {
-      onFrame(frame, width, height, tick) {
+      onFrame(frame, width, height, depth, tick) {
         const fs = frameRef.current;
         const prev = fs.data;
         fs.data = frame;
         fs.width = width;
         fs.height = height;
+        fs.depth = depth;
         fs.tick = tick;
         fs.version++;
         if (prev && prev !== frame) src?.recycle(prev);
@@ -92,18 +97,18 @@ export function useSimulation() {
       },
     };
     src = kind === 'cloud'
-      ? new CloudSource(ev)
-      : new LocalSource(ev, { params: telemetryRef.current?.params });
+      ? new CloudSource(ev, world)
+      : new LocalSource(ev, { world, params: telemetryRef.current?.params });
     sourceRef.current = src;
     return () => {
       src?.dispose();
       if (sourceRef.current === src) sourceRef.current = null;
     };
-  }, [kind]);
+  }, [kind, world]);
 
   const send = useCallback((msg: ClientMsg) => sourceRef.current?.send(msg), []);
 
-  const inspect = useCallback((x: number, y: number): Promise<InspectResult | null> => {
+  const inspect = useCallback((x: number, y: number, z = 0): Promise<InspectResult | null> => {
     const src = sourceRef.current;
     if (!src) return Promise.resolve(null);
     const id = nextId.current++;
@@ -112,7 +117,7 @@ export function useSimulation() {
       setTimeout(() => {
         if (waiters.current.delete(id)) resolve(null);
       }, 4000);
-      src.send({ type: 'inspect', id, x, y });
+      src.send({ type: 'inspect', id, x, y, z });
     });
   }, []);
 
@@ -122,7 +127,7 @@ export function useSimulation() {
 
   const getPool = useCallback(async () => sourceRef.current?.getPool() ?? null, []);
 
-  return { kind, setKind, status, telemetry, notice, history, frameRef, send, inspect, resync, getPool };
+  return { kind, setKind, world, setWorld, status, telemetry, notice, history, frameRef, send, inspect, resync, getPool };
 }
 
 export type SimulationApi = ReturnType<typeof useSimulation>;
