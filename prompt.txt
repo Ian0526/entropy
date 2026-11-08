@@ -1,0 +1,241 @@
+# Role & Objective
+You are a Principal Systems Architect, Artificial Life Researcher, and Full-Stack Performance Engineer. 
+Your task is to architect and implement **"TuringLife"**—a next-generation, thermodynamic, mutable-genome cellular automaton designed to exhibit emergent agency, homeostatic healing, and sensory-driven foraging.
+
+The application must be engineered specifically for deployment on **Railway (CPU-bound container environment running on vCPUs without dedicated GPUs)**, powered by a **Hybrid Quantum-Entropy Pool (ANU QRNG API + Nonce-Wrapped Chaotic Sponge Fallback)** so that mutations, stochastic phase ticks, and symmetry-breaking events are driven by true physical indeterminism. It must also feature a cross-compatible **Desktop + Mobile Frontend UI** running at 60 FPS.
+
+---
+
+# Part 1: Core Simulation Engine Architecture (The "Turing-Grade" Physics)
+
+Do NOT build a standard binary Conway's Game of Life. Implement a continuous-energy, asynchronous-ready, multi-layered grid where every cell `(x, y)` is stored in contiguous flat memory (`Float32Array` / `Uint32Array` Structure-of-Arrays for L1/L2 CPU cache locality on Railway vCPUs).
+
+### 1. Dual-Layer Cell State (Structure of Arrays)
+For a grid of size $W \times H$ (default $256 \times 256$, configurable):
+- `somaticState` (`Uint8Array`): `0` = Empty, `1` = Core/Metabolic, `2` = Armor/Wall, `3` = Sensor/Cilia.
+- `energy` (`Float32Array`): Internal cell energy $E \in [0.0, 1.0]$.
+- `ambientFood` (`Float32Array`): Environmental resource density $F \in [0.0, 1.0]$ regenerated via drifting Simplex noise pockets.
+- `signalFieldA` & `signalFieldB` (`Float32Array`): Two low-cost sub-grid phase/chemical channels that propagate across connected somatic cells $4\times$ faster than physical movement, enabling internal "nervous system" computation before action.
+- `genome` (`Uint32Array` or stride-based `Float32Array`): A compact 64-bit (or 8-float) rule vector carried by each live cell that dictates:
+  1. Energy harvest vs. signal emission thresholds.
+  2. Chemotaxis weights (how strongly it pulls/pushes energy toward food gradients vs. signal gradients).
+  3. Kin-recognition hash (identifies whether an adjacent cell is self, kin, or foreign prey/predator).
+  4. Epigenetic memory register (2 mutable state bits that persist across ticks without mutating the core genome, allowing short-term learning after taking damage).
+
+### 2. Thermodynamic & Evolutionary Rules
+- **Strict Conservation & Entropic Bleed:** Every live cell loses $\Delta E_{\text{decay}}$ per tick based on its `somaticState` (Armor costs less to maintain than Sensors; emitting signals costs 5% of physical replication). If $E \le 0$, the cell dies and returns a fraction of its mass to `ambientFood`.
+- **Metabolic Routing:** Connected kin cells automatically equalize/pump energy along internal signal gradients so a "mouth" edge harvesting food can feed a "shield" or "locomotion" edge on the opposite side of the organism.
+- **Quantum-Driven Replication & Asynchronous Ticks:** 
+  - Cell update order and stochastic Poisson phase ticks are governed by the Quantum Entropy Pool to prevent deterministic directional bias (grid artifacts).
+  - When $E > \text{threshold}$, a cell divides into an empty neighbor, splitting its energy and copying its `genome` with quantum-seeded bit-flip/Gaussian mutations ($\mu$).
+
+---
+
+# Part 2: The ANU QRNG Cron & Nonce-Wrapped Quantum Entropy Engine
+
+True physical indeterminism is required for mutation and symmetry breaking, but the **ANU QRNG API** (`https://qrng.anu.edu.au/API/jsonI.php?length=1024&type=uint16` or the AWS Open API endpoint) strictly rate-limits requests. Implement a dedicated `QuantumEntropyEngine` (`src/engine/QuantumEntropy.ts`) shared with the simulation worker via `SharedArrayBuffer`:
+
+### 1. Background Cron Harvester
+- Run an asynchronous background task (every 60 seconds, with exponential backoff on HTTP `429 Too Many Requests` or timeout) that fetches a batch of `1024` `uint16` quantum random integers from the ANU QRNG API.
+- Write incoming quantum values into a circular ring buffer `quantumPool` (`Uint16Array(1024)`).
+
+### 2. Primary Consumption & Nonce Progression
+- Track `poolExhausted: boolean`, `cursor: uint32`, and a monotonically increasing 64-bit/32-bit `nonce`.
+- While fresh unconsumed quantum numbers exist in the current batch, step through the buffer sequentially using `nonce++` to regularly inject fresh quantum entropy into the simulation's high-speed PRNG state.
+
+### 3. Rate-Limit / Exhaustion Fallback: Dynamic Nonce-Wrapped Seed Jumping
+When the system consumes all fresh values in the current batch (or ANU rate-limits the server), DO NOT fall back to a static `Math.random()`. Instead, use the existing `quantumPool` values to continuously re-seed and perturb a high-speed 128-bit chaotic PRNG (`SFC32` or `xoshiro128**`) using **Nonce-Wrapped Index Jumping with Anti-Cycle Protection**:
+- Let $L = 1024$ (buffer length, power of 2 so modulo is `& 1023`).
+- Maintain two pointers: `jumpIdx` (data-driven jump pointer) and `weylIdx` (anti-cycle pointer), plus `nonce`.
+- Whenever the fast PRNG needs a re-seed/entropy injection (e.g., at the start of every simulation tick or every $N$ draws):
+  1. Read current quantum value: `val = quantumPool[jumpIdx]`.
+  2. Increment `nonce = (nonce + 1) >>> 0`.
+  3. **Dynamic Nonce-Wrapped Jump with Anti-Recursion Offset:** Advance `jumpIdx` by `val` indices, wrapping around the buffer length $L$. If `(jumpIdx + val) & (L - 1)` lands on `jumpIdx` (a self-loop where `val % L === 0`) or repeats the previous index, inject `+ 1 + (nonce & 1)` (or force an odd co-prime stride `(val + nonce) | 1`) so the wrap is mathematically guaranteed never to lock into a static recursive loop.
+  4. **Mutate-in-Place (Optional Sponge Mix):** Mix a rotated hash of `nonce` and CPU nanosecond jitter (`Number(process.hrtime.bigint() & 0xFFFFn)`) into the read seed (`seed = val ^ rotl(nonce, 7) ^ hrtimeJitter`) and absorb it via XOR/addition into the 128-bit `SFC32` state registers.
+- Expose a zero-allocation `nextFloat(): number` and `nextUint32(): number` method to the simulation loop that draws from this quantum-perturbed state in `< 2 nanoseconds` per call.
+- Expose live entropy telemetry to the frontend: `Entropy Mode: LIVE QUANTUM (ANU)` vs. `QUANTUM SPONGE FALLBACK (Rate-Limited / Nonce-Wrapping)`, `Last ANU Fetch Timestamp`, `Total Nonce Wraps`, and `Current Jump Index`.
+
+---
+
+# Part 3: Railway vCPU Optimization & Hybrid Execution Model
+
+Because this will run on **Railway vCPUs**:
+1. **Worker Thread Offloading (Backend):** Run the authoritative simulation tick loop inside a dedicated Node.js `worker_threads` worker using `SharedArrayBuffer` for both the simulation grid and the `QuantumEntropyEngine` ring buffer so the main Fastify/Node HTTP, Cron, & WebSocket server never drops health checks.
+2. **Binary Delta / Frame Streaming:** Stream grid states to connected clients over WebSockets using binary `ArrayBuffer` packets (quantized `Uint8Array` views for rendering layers + binary/JSON telemetry header every 10 ticks).
+3. **Client-Side Local Compute Toggle:** Allow the user to switch between:
+   - **Shared Cloud Universe (Railway vCPU Authoritative):** Watches and interacts with the persistent server instance fed by the server's ANU QRNG cron job.
+   - **Local Sandbox Mode (Client WebWorker):** Offloads simulation to the browser's WebWorker, seeding its local `QuantumEntropyEngine` from the server's latest quantum pool snapshot.
+
+---
+
+# Part 4: Cross-Platform Frontend UI & Visual Specification
+
+Build the frontend using **Next.js (App Router) or Vite + React 19, TypeScript, Tailwind CSS, and Lucide Icons**, using an **HTML5 `<canvas>` with WebGL2 / 2D OffscreenCanvas** for the viewport.
+
+### 1. Visual Layer Compositor (The Microscope View)
+Provide instant hotkeys and touch-pills to toggle or blend 4 distinct visual shaders/layers:
+- **Composite Bio-View (Default):** Renders `ambientFood` as a bioluminescent emerald nebula background; renders `somaticState` cells colored by their `genome` lineage hash, brightness scaled by `energy`, and structural borders indicating cell walls vs. sensors.
+- **Neural / Signal Layer View:** Dims physical bodies and highlights high-frequency `signalFieldA/B` ripples firing across organisms.
+- **Thermodynamic Heatmap:** Renders metabolic flux—starving cells (crimson), surplus harvesters (cyan), and entropic bleed.
+- **Lineage & Speciation X-Ray:** Colors organisms strictly by phylogenetic distance from the original seed ancestor.
+
+### 2. Quantum Entropy Status Pill & Visualizer
+Include a dedicated **"Quantum Core" HUD Widget** in the UI that shows:
+- Live status badge: **🟢 ANU QRNG Direct** or **🟣 Quantum Nonce-Wrap Sponge (Fallback Active)**.
+- A miniature circular or bar visualizer of the 1024-slot `quantumPool` showing the `jumpIdx` pointer hopping across indices in real time as nonces increment.
+- Manual "Force ANU Resync" button (respecting rate-limit cooldown timer).
+
+### 3. Responsive Layout Architecture (Desktop vs. Mobile)
+- **Viewport Core:** Full-bleed interactive canvas (`100dvw x 100dvh`) with smooth pan-and-zoom (`wheel` + click-drag on desktop; two-finger pinch-to-zoom + pan on mobile via pointer events, with `touch-action: none`).
+- **Desktop Layout (`lg:` and up):**
+  - **Left Floating Dock:** Glassmorphic (`backdrop-blur-md bg-slate-950/80 border-slate-800`) collapsible control panel for Physics Sliders (Metabolic Decay, Mutation Rate $\mu$, Signal Speed, Food Scarcity) and Layer Toggles.
+  - **Right Floating Dock:** Live Telemetry, the **Quantum Entropy Visualizer**, Speciation Sparklines, and an **Organism Inspector** showing the exact genome vector and epigenetic state of any clicked cell cluster.
+  - **Bottom Floating Action Bar:** Play/Pause, Tick Rate (`1x`, `5x`, `Max vCPU`), and **"Turing Perturbation Tools"** (Poke/Damage Brush, Quantum Radiation Mutagen Brush, Wall Barrier Drawer, Food Dropper, Predator Injector).
+- **Mobile Layout (`< lg:`):**
+  - Top compact HUD bar showing FPS, Tick/sec, Population, and Quantum Status badge.
+  - Bottom thumb-zone toolbar with Perturbation Brushes and Layer Toggles.
+  - Slide-up **Bottom Sheet / Drawer** for Physics Sliders, Quantum Pool Telemetry, and the Organism Inspector.
+
+---
+
+# Part 5: Deliverables & Implementation Order
+
+Generate the complete, production-ready codebase structured for a single-repo Railway deployment:
+1. **Project Structure & `Dockerfile` / `railway.json`** configured for production vCPU execution.
+2. **The Quantum Entropy Engine (`src/engine/QuantumEntropy.ts`)**: Full implementation of the ANU QRNG cron fetcher, `Uint16Array` ring buffer, nonce-wrapped index jumper with anti-cycle `+ 1` / odd-stride protection, and `SFC32` chaotic sponge mixer.
+3. **The Simulation Core (`src/engine/SimulationCore.ts`)**: Full `TypedArray` Structure-of-Arrays implementation consuming `QuantumEntropyEngine`.
+4. **The Worker & WebSocket Bridge (`src/server/`)**: Non-blocking worker loop + binary frame broadcaster.
+5. **The Cross-Platform Frontend (`src/components/`)**: Full responsive Desktop/Mobile UI including `SimulationCanvas.tsx`, `QuantumEntropyHUD.tsx`, `ControlDrawer.tsx`, and `OrganismInspector.tsx`.
+
+Write complete, working bitwise and mathematical implementations for both the `QuantumEntropyEngine` and `SimulationCore`—no placeholder `// TODO` comments.
+Reference Implementation: The Nonce-Wrapped Quantum Sponge (QuantumEntropy.ts)If you want to inspect or drop the exact TypeScript math directly into your codebase, here is how the nonce-wrapped index jumper + SFC32 chaotic sponge works under the hood with zero heap allocations:TypeScriptexport class QuantumEntropyEngine {
+  private readonly POOL_SIZE = 1024; // Power of 2 for fast bitwise modulo (& 1023)
+  private readonly POOL_MASK = 1023;
+  private pool: Uint16Array;
+
+  // Pointers & Telemetry
+  private jumpIdx = 0;
+  private nonce = 0;
+  private freshRemaining = 0;
+  public mode: 'LIVE_QUANTUM' | 'NONCE_WRAP_SPONGE' = 'NONCE_WRAP_SPONGE';
+  public lastFetchTime = 0;
+  public totalWraps = 0;
+
+  // 128-bit SFC32 Chaotic PRNG State (4 x 32-bit unsigned ints)
+  private s0 = 0x9e3779b9;
+  private s1 = 0x243f6a88;
+  private s2 = 0xb7e15162;
+  private s3 = 1;
+
+  constructor(sharedBuffer?: SharedArrayBuffer) {
+    this.pool = sharedBuffer
+      ? new Uint16Array(sharedBuffer, 0, this.POOL_SIZE)
+      : new Uint16Array(this.POOL_SIZE);
+
+    // Bootstrap pool with crypto.getRandomValues until first ANU cron completes
+    crypto.getRandomValues(this.pool);
+    this.absorbQuantumSeed();
+  }
+
+  /**
+   * Cron Task Method: Call every 60s on the Node backend
+   */
+  public async fetchFromANU(): Promise<boolean> {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+
+      const res = await fetch(
+        `https://qrng.anu.edu.au/API/jsonI.php?length=${this.POOL_SIZE}&type=uint16`,
+        { signal: controller.signal }
+      );
+      clearTimeout(timeout);
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+
+      if (json && json.success && Array.isArray(json.data)) {
+        for (let i = 0; i < this.POOL_SIZE && i < json.data.length; i++) {
+          this.pool[i] = json.data[i] & 0xffff;
+        }
+        this.freshRemaining = this.POOL_SIZE;
+        this.mode = 'LIVE_QUANTUM';
+        this.lastFetchTime = Date.now();
+        return true;
+      }
+    } catch {
+      // Rate limited (429) or network timeout -> seamlessly stay in NONCE_WRAP_SPONGE mode
+      this.mode = 'NONCE_WRAP_SPONGE';
+    }
+    return false;
+  }
+
+  /**
+   * Your Nonce-Wrapped Index Jumper + Anti-Recursion Injection
+   * Called once per simulation tick (or every 256 draws) to inject quantum indeterminism
+   * into the 128-bit chaotic state without exhausting the buffer in 1 millisecond.
+   */
+  public absorbQuantumSeed(): void {
+    this.nonce = (this.nonce + 1) >>> 0;
+    const currentVal = this.pool[this.jumpIdx];
+
+    if (this.freshRemaining > 0) {
+      this.freshRemaining--;
+      if (this.freshRemaining === 0) {
+        this.mode = 'NONCE_WRAP_SPONGE';
+      }
+    }
+
+    // Calculate next index by iterating `currentVal` positions forward
+    let nextIdx = (this.jumpIdx + currentVal) & this.POOL_MASK;
+
+    // Anti-recursion guard: If wrapping lands on the exact same index (e.g., val % 1024 === 0)
+    // or forms a 2-step oscillation, inject +1 plus a Weyl odd offset derived from the nonce
+    if (nextIdx === this.jumpIdx || ((nextIdx + this.pool[nextIdx]) & this.POOL_MASK) === this.jumpIdx) {
+      const antiCycleOffset = 1 + ((this.nonce * 0x9e3779b9) & 7); // Guarantees escape from short cycles
+      nextIdx = (nextIdx + antiCycleOffset) & this.POOL_MASK;
+      this.totalWraps++;
+    } else if (this.jumpIdx + currentVal >= this.POOL_SIZE) {
+      this.totalWraps++;
+    }
+
+    this.jumpIdx = nextIdx;
+    const wrappedQuantumVal = this.pool[this.jumpIdx];
+
+    // Combine the two quantum values with the monotonic nonce
+    const quantumImpulse = ((currentVal << 16) | wrappedQuantumVal) ^ this.nonce;
+
+    // Absorb into SFC32 state registers (Chaotic Bijection Mixing)
+    this.s0 = (this.s0 ^ quantumImpulse) >>> 0;
+    this.s1 = (this.s1 + ((quantumImpulse * 0x85ebca6b) >>> 0)) >>> 0;
+    // Run 4 warm-up rounds to diffuse the single-bit quantum differences across all 128 bits
+    this.nextUint32();
+    this.nextUint32();
+  }
+
+  /**
+   * Fast 32-bit draw (< 1.5ns on Railway vCPU)
+   */
+  public nextUint32(): number {
+    // Auto-reabsorb from the quantum ring buffer every 512 draws
+    if ((this.s3 & 511) === 0) {
+      this.absorbQuantumSeed();
+    }
+
+    const t = (this.s0 + this.s1 + this.s3) >>> 0;
+    this.s3 = (this.s3 + 1) >>> 0;
+    this.s0 = this.s1 ^ (this.s1 >>> 9);
+    this.s1 = (this.s2 + (this.s2 << 3)) >>> 0;
+    this.s2 = ((this.s2 << 21) | (this.s2 >>> 11)) >>> 0;
+    this.s2 = (this.s2 + t) >>> 0;
+    return t;
+  }
+
+  /**
+   * Normalized float [0.0, 1.0) for metabolic & mutation checks
+   */
+  public nextFloat(): number {
+    return this.nextUint32() / 4294967296;
+  }
+}
+Quick Tip on the ANU API Endpoint in 2026The legacy [https://qrng.anu.edu.au/API/jsonI.php](https://qrng.anu.edu.au/API/jsonI.php) endpoint frequently throttles unauthenticated cloud datacenter IPs (including Railway's AWS/GCP egress ranges) to 1 request per minute. If you notice Railway getting 429 responses almost immediately, ANU also offers [https://api.quantumnumbers.anu.edu.au](https://api.quantumnumbers.anu.edu.au) (which gives a free tier API key via AWS API Gateway), or you can leave the legacy URL as-is—because with this QuantumEntropyEngine class, even one successful fetch per hour gives you $1,024 \times 16 = 16,384$ bits of genuine quantum vacuum fluctuation state, which is more than enough to keep the nonce-wrapped sponge mathematically non-repeating for the lifetime of the universe.
