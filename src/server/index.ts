@@ -334,6 +334,22 @@ app.get('/health', async (_req, reply) => {
 
 app.get<{ Querystring: { world?: string } }>('/api/telemetry', async (req) => worldOf(req.query.world).latestTelemetry);
 
+// Desktop-wallpaper mode only (scripts/wallpaper sets WALLPAPER=1 on a 127.0.0.1 server): a watcher
+// script reports what the PC is doing (a fullscreen game, heavy load), and the page slows the
+// world to a crawl so it never competes with what you're actually doing.
+if (process.env.WALLPAPER === '1') {
+  let hold: { level: 'run' | 'slow'; reason: string } = { level: 'run', reason: '' };
+  app.get('/api/wallpaper/hold', async (_req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    return hold;
+  });
+  app.post<{ Body: { level?: string; reason?: string } }>('/api/wallpaper/hold', async (req) => {
+    const level = req.body?.level;
+    hold = { level: level === 'slow' ? level : 'run', reason: String(req.body?.reason ?? '').slice(0, 80) };
+    return hold;
+  });
+}
+
 app.get('/api/quantum/pool', async (_req, reply) => {
   reply.header('Cache-Control', 'no-store');
   return { pool: Array.from(entropy.snapshot()), telemetry: entropy.telemetry() };

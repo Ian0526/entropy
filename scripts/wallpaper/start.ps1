@@ -1,18 +1,24 @@
 # Runs TuringLife as the live desktop background, behind the icons.
-#   powershell -ExecutionPolicy Bypass -File scripts\wallpaper\start.ps1 [-World morpho|machines|life|2d|3d] [-Regime id] [-Rule bombers|starwars] [-CellPx n] [-Port 8077]
+#   powershell -ExecutionPolicy Bypass -File scripts\wallpaper\start.ps1 [-World morpho|machines|life|2d|3d] [-Regime id] [-Rule bombers|starwars] [-CellPx n] [-Settings s] [-NoMouse] [-NoHold] [-Port 8077]
 #   morpho = the Morphogenesis world (default): multi-channel Lenia, the Director drifting between
-#            regimes; -Regime protozoa|web|… pins one regime (no drifting),
+#            regimes; -Regime protozoa|protozoa-hd|web|… pins one regime (no drifting),
+#            -Settings takes the string the /morpho lab's Controls → Wallpaper gives (look, colours,
+#            pointer, physics); moving the mouse over the desktop stirs it unless -NoMouse; it
+#            slows to a crawl while a fullscreen app (a game) runs or the GPU or CPU is busy
+#            (watch.ps1), unless -NoHold,
 #   machines = a Generations rule fed by quantum rain (Bombers unless -Rule starwars),
 #   life = SmoothLife fed by quantum rain, 2d/3d = the TuringLife ecosystem.
 # Starts a local server (127.0.0.1 only, no password, nothing saved), opens the /wallpaper page in a
 # chromeless Edge window, and parents that window to the desktop's WorkerW layer.
 # Stop it with scripts\wallpaper\stop.ps1.
-param([ValidateSet('morpho', 'machines', 'life', '2d', '3d')][string]$World = 'morpho', [string]$Regime = '', [ValidateSet('bombers', 'starwars')][string]$Rule = 'bombers', [int]$Port = 8077, [int]$CellPx = 0)
+param([ValidateSet('morpho', 'machines', 'life', '2d', '3d')][string]$World = 'morpho', [string]$Regime = '', [ValidateSet('bombers', 'starwars')][string]$Rule = 'bombers', [int]$Port = 8077, [double]$CellPx = 0, [string]$Settings = '', [switch]$NoMouse, [switch]$NoHold)
 if ($CellPx -le 0) { $CellPx = $(if ($World -eq 'morpho') { 3 } else { 5 }) }
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path "$PSScriptRoot\..\..").Path
 $profileDir = Join-Path $env:LOCALAPPDATA 'TuringLifeWallpaper'
-$url = "http://127.0.0.1:$Port/wallpaper?world=$World&rule=$Rule&cell=$CellPx"
+$cell = $CellPx.ToString([Globalization.CultureInfo]::InvariantCulture)
+$url = "http://127.0.0.1:$Port/wallpaper?world=$World&rule=$Rule&cell=$cell"
+if ($Settings) { $url += "&s=$([Uri]::EscapeDataString($Settings))" }
 if ($Regime) { $url += "&regime=$Regime&auto=0" } # a named regime stays put
 
 Add-Type @'
@@ -63,7 +69,7 @@ public static class Desk {
 $up = $false
 if (-not $up) {
   if (-not (Test-Path "$repo\dist\server\index.js")) { throw "Build first: npm run build" }
-  $env:PORT = "$Port"; $env:HOST = '127.0.0.1'; $env:QRNG_PROVIDER = 'lfdr'
+  $env:PORT = "$Port"; $env:HOST = '127.0.0.1'; $env:QRNG_PROVIDER = 'lfdr'; $env:WALLPAPER = '1'
   # One copy of the world fills the desktop: shaped like the screen, one cell per $CellPx pixels (at most 1024 wide).
   Add-Type -AssemblyName System.Windows.Forms
   $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
@@ -114,4 +120,18 @@ $worker = [Desk]::WorkerW()
 if ($worker -eq [IntPtr]::Zero) { throw "Couldn't find the desktop's WorkerW layer." }
 Start-Sleep -Milliseconds 800
 [Desk]::Attach($win, $worker, 40)
+
+# 4. The mouse: moves over the desktop are relayed to the page, so the pointer stirs the world.
+#    (Clicks are left to the desktop: forwarding them would steal them from the icons.)
+if (-not $NoMouse) {
+  Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSScriptRoot\mouse.ps1`"", '-Hwnd', "$([long]$win)", '-Tag', 'TuringLifeWallpaper'
+  ) | Out-Null
+}
+# 5. The PC watcher: crawl while a game, a fullscreen app or heavy load is running.
+if (-not $NoHold -and $World -eq 'morpho') {
+  Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSScriptRoot\watch.ps1`"", '-Port', "$Port", '-Tag', 'TuringLifeWallpaper'
+  ) | Out-Null
+}
 Write-Host "TuringLife ($World) is now your desktop background. Stop: scripts\wallpaper\stop.ps1"

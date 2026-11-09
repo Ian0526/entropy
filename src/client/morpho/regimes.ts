@@ -33,7 +33,7 @@ export interface Regime {
   id: string;
   name: string;
   blurb: string;
-  /** Kernel radius in cells, and time resolution (dt = 1/T). */
+  /** Kernel radius in cells (may be fractional mid-transition), and time resolution (dt = 1/T). */
   R: number;
   T: number;
   kernels: KernelSpec[];
@@ -69,13 +69,17 @@ export function shell(b: number[], rho: number): number {
 
 export const growth = (u: number, m: number, s: number) => 2 * bell(u, m, s) - 1;
 
-/** Normalised weights of kernel k over the (2R+1)² square of offsets, row-major from (-R,-R). */
-export function kernelWeights(R: number, k: KernelSpec): Float32Array {
+/** The kernel's reach in whole cells (R may be fractional). */
+export const reach = (R: number) => Math.ceil(R - 1e-6);
+
+/** Normalised weights of kernel k over the (2⌈R⌉+1)² square of offsets, row-major from (-⌈R⌉,-⌈R⌉). */
+export function kernelWeights(Rf: number, k: KernelSpec): Float32Array {
+  const R = reach(Rf);
   const n = 2 * R + 1;
   const w = new Float32Array(n * n);
   let sum = 0;
   for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
-    const v = shell(k.b, Math.hypot(dx, dy) / (R * k.r));
+    const v = shell(k.b, Math.hypot(dx, dy) / (Rf * k.r));
     w[(dy + R) * n + dx + R] = v;
     sum += v;
   }
@@ -156,8 +160,73 @@ REGIMES.splice(1, 0, {
   blurb: 'The Protozoa law at twice the scale. Each organism carries its own quantum genome: a slightly different law and its own spin, clockwise or counter-clockwise, driven by curl flow along the field.',
 });
 
+/**
+ * Protozoa under the microscope: the same law at R 16 (μ +0.007 so the larger kernel doesn't flood),
+ * with a touch of curl, swirl and speciation, so each colony gets its own hue and slowly rotates
+ * while keeping Protozoa's chains and bounces.
+ */
+REGIMES.splice(1, 0, {
+  ...protozoa,
+  id: 'protozoa-hd', name: 'Protozoa · Microscope', R: 16, omega: 0.025, sync: 0.45, swirl: 0.08,
+  kernels: protozoa.kernels.map((k) => ({ ...k, m: k.m + 0.007 })),
+  speciation: 0.006, curl: 0.45, vortexMu: 0.008,
+  blurb: 'Protozoa a third larger, each colony with its own genome: its own hue, a slightly different law, and a gentle spin from curl flow. Chains and bounces as in Protozoa.',
+});
+
 const ALIASES: Record<string, string> = { aquarium: 'protozoa' };
 export const regimeById = (id: string | null | undefined) => {
   const key = id ? ALIASES[id] ?? id : id;
   return REGIMES.find((r) => r.id === key) ?? REGIMES[0];
 };
+
+/** Relative GPU cost of a regime's field pass per occupied cell: the taps in its disk, times kernel groups. */
+export const regimeCost = (r: Regime) => r.R * r.R * Math.ceil(r.kernels.length / 4);
+
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const sameShape = (a: KernelSpec, b: KernelSpec) =>
+  a.c0 === b.c0 && a.c1 === b.c1 && a.b.length === b.b.length;
+
+/**
+ * How two regimes can be morphed into each other:
+ *  - 'pair': the same kernels in the same order (the Protozoa family): every number is interpolated,
+ *    R included, so organisms grow or shrink into the new law;
+ *  - 'union': both kernel sets fit in the shader at once: the old kernels' growth weights fade out
+ *    while the new ones fade in, each at its own absolute radius;
+ *  - null: neither; the world has to be dimmed, cleared and reseeded.
+ */
+export function morphKind(a: Regime, b: Regime, maxKernels = 16): 'pair' | 'union' | null {
+  if (a.kernels.length === b.kernels.length && a.kernels.every((k, i) => sameShape(k, b.kernels[i]))) return 'pair';
+  if (a.kernels.length + b.kernels.length <= maxKernels) return 'union';
+  return null;
+}
+
+/** The law a fraction t of the way from a to b (see morphKind). */
+export function blendRegimes(a: Regime, b: Regime, t: number, kind: 'pair' | 'union'): Regime {
+  const num = (x: number | undefined, y: number | undefined) => lerp(x ?? 0, y ?? 0, t);
+  const base: Regime = {
+    ...(t < 0.5 ? a : b),
+    omega: lerp(a.omega, b.omega, t), sync: lerp(a.sync, b.sync, t), swirl: lerp(a.swirl, b.swirl, t),
+    flow: num(a.flow, b.flow), curl: num(a.curl, b.curl), speciation: num(a.speciation, b.speciation), vortexMu: num(a.vortexMu, b.vortexMu),
+    T: lerp(a.T, b.T, t),
+  };
+  if (kind === 'pair') {
+    return {
+      ...base,
+      R: lerp(a.R, b.R, t),
+      kernels: a.kernels.map((k, i) => {
+        const o = b.kernels[i];
+        return { ...k, b: k.b.map((v, j) => lerp(v, o.b[j], t)), r: lerp(k.r, o.r, t), m: lerp(k.m, o.m, t), s: lerp(k.s, o.s, t), h: lerp(k.h, o.h, t) };
+      }),
+    };
+  }
+  // Union: one R that reaches both sets; each kernel keeps its own absolute radius.
+  const R = Math.max(a.R, b.R);
+  return {
+    ...base,
+    R,
+    kernels: [
+      ...a.kernels.map((k) => ({ ...k, r: (k.r * a.R) / R, h: k.h * (1 - t) })),
+      ...b.kernels.map((k) => ({ ...k, r: (k.r * b.R) / R, h: k.h * t })),
+    ],
+  };
+}

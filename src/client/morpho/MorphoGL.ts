@@ -17,7 +17,8 @@
  * Seeds, erasers and the statistics read back by the Director are separate small passes.
  */
 import type { Regime } from './regimes';
-import { kernelWeights } from './regimes';
+import { DEFAULT_SETTINGS, type DisplaySettings } from './settings';
+import { kernelWeights, reach } from './regimes';
 
 export const MAX_KERNELS = 16;
 const MAX_STAMPS = 8;
@@ -158,6 +159,7 @@ uniform sampler2D uP0, uP1;
 uniform int uR;
 uniform vec2 uRing[${RING_TAPS}];
 uniform float uDt, uOmega, uSync, uSwirl, uFlow, uCurl, uSpec;
+uniform vec3 uUsed; // 1 for channels some kernel of the law writes
 layout(location = 0) out vec4 o;
 layout(location = 1) out vec4 oAux;
 const float TAU = 6.28318531;
@@ -205,7 +207,9 @@ void main() {
   }
   float mass = self.r + self.g + self.b;
   float dth = uOmega * (0.4 + mass) + uSync * 0.1 * Z.y / M;
-  o = vec4(clamp(base + uDt * p0.rgb, 0.0, 1.0), fract(th + uDt * dth));
+  // A channel no kernel writes has no growth at all, so whatever an earlier law left in it would
+  // stay forever; it fades out instead (gone in ~3 s at 30 steps/s).
+  o = vec4(clamp(base + uDt * p0.rgb - 0.025 * (1.0 - uUsed), 0.0, 1.0), fract(th + uDt * dth));
 
   // Genome: inherited from the mass around (so it travels with its organism), and vorticity of
   // last step's flow, for the field pass.
@@ -216,7 +220,10 @@ void main() {
   oAux = vec4(g, abs(vort) * float(uR), v);
 }`;
 
-// Seeds and erasers. kind 0: noise patch, 1: harmonic ring cos(mφ) with a phase winding, 2: erase.
+// Seeds and erasers. kind 0: noise patch, 1: harmonic ring cos(mφ) with a phase winding, 2: erase,
+// 3: stir (matter within a Gaussian of radius size is dragged by uB.xy cells, genome and all),
+// 4: ripple (a faint ring of mass on the channels in use plus a phase winding; genomes untouched),
+// 5: clone (the disk of radius size around (x, y) + uB.xy is copied here, phase and genome too).
 const STAMP_FS = `${COMMON}
 uniform int uCount;
 uniform vec4 uA[${MAX_STAMPS}]; // x, y, size, kind
@@ -260,8 +267,28 @@ void main() {
       s.rgb = min(vec3(1.0), s.rgb + v * c.rgb);
       if (v > 0.2) s.a = fract(b.y + c.w * f / 6.28318531);
       if (v > 0.05) x.x = uG[i];
-    } else {
+    } else if (a.w < 2.5) {
       s.rgb *= smoothstep(a.z * 0.6, a.z, r);
+    } else if (a.w < 3.5) {
+      float k = exp(-r * r / (2.0 * a.z * a.z));
+      if (k > 0.01) {
+        vec2 src = vec2(p) + 0.5 - k * b.xy;
+        s.rgb = texture(uState, src / size).rgb;
+        x.x = aux(ivec2(floor(src))).x;
+      }
+    } else if (a.w > 4.5) {
+      float k = 1.0 - smoothstep(0.75 * a.z, a.z, r);
+      if (k > 0.0) {
+        ivec2 q = p + ivec2(round(b.xy));
+        vec4 src = at(q);
+        s.rgb = mix(s.rgb, src.rgb, k);
+        if (k > 0.5) { s.a = src.a; x.x = aux(q).x; }
+      }
+    } else {
+      float prof = exp(-(r - a.z) * (r - a.z) / (2.0 * b.z * b.z));
+      float f = atan(d.y, d.x);
+      s.rgb = min(vec3(1.0), s.rgb + prof * (0.7 + 0.3 * cos(b.x * f)) * c.rgb);
+      s.a = fract(s.a + prof * (b.y + c.w * f / 6.28318531));
     }
   }
   o = s;
@@ -285,58 +312,128 @@ void main() {
   o = vec4(sum / 36.0, alive / 36.0);
 }`;
 
-// Deep-space palette: obsidian vacuum, an indigo halo where potential is low, the three channels
-// as cyan / magenta / gold, and edges lit by the gradient magnitude so ribs and symmetry lines glow.
+// The picture. Every term is weighted by a display setting (settings.ts), so one shader draws
+// every look: "Classic glow" is body + edge + halo + crests; "Microscope" adds DIC relief from the
+// mass as an optical thickness map, thin-film iridescence on steep membranes, a wet specular
+// highlight, organelle rings, nucleus glow, vorticity glow (from the aux texture), a film
+// tonemap, sensor grain and a lens vignette.
+// The grid is upscaled with Catmull-Rom (9 hardware-bilinear taps) instead of bilinear, and the
+// halo samples two rings through the linear sampler, so cells don't show at cellPx 2–3.
 const SHOW_FS = `${COMMON}
 uniform vec2 uView;
 uniform vec3 uCol[3];
-uniform float uGeneTint;
+uniform vec3 uBg, uHaloCol;
+uniform int uFilter; // 0 bilinear, 1 bicubic
+uniform sampler2D uPrev; // the state one step back, for motion between steps
+uniform float uBlend;    // 1 = the current state; less blends toward the previous one
+uniform float uExposure, uBody, uEdge, uHalo, uHaloR, uCrests;
+uniform float uRelief, uIrid, uSpec, uPellicle, uNucleus, uVort, uGeneTint, uTone, uGrain, uVignette;
 out vec4 o;
 const float TAU = 6.28318531;
 
-vec4 bilinear(vec2 g) {
+vec3 linOf(sampler2D t, vec2 g) { return texture(t, g / vec2(uSize)).rgb; }
+vec3 lin(vec2 g) { return linOf(uState, g); }
+
+// Catmull-Rom through the bilinear sampler: 9 taps instead of 16 (g in cells, centres at +0.5).
+vec3 catrom(sampler2D T, vec2 g) {
+  vec2 tc = floor(g - 0.5) + 0.5;
+  vec2 f = g - tc;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  vec2 w3 = f * f * (-0.5 + 0.5 * f);
+  vec2 w12 = w1 + w2;
+  vec2 t0 = tc - 1.0, t3 = tc + 2.0, t12 = tc + w2 / w12;
+  vec3 c = (linOf(T, vec2(t0.x, t0.y)) * w0.x + linOf(T, vec2(t12.x, t0.y)) * w12.x + linOf(T, vec2(t3.x, t0.y)) * w3.x) * w0.y
+         + (linOf(T, vec2(t0.x, t12.y)) * w0.x + linOf(T, vec2(t12.x, t12.y)) * w12.x + linOf(T, vec2(t3.x, t12.y)) * w3.x) * w12.y
+         + (linOf(T, vec2(t0.x, t3.y)) * w0.x + linOf(T, vec2(t12.x, t3.y)) * w12.x + linOf(T, vec2(t3.x, t3.y)) * w3.x) * w3.y;
+  return max(c, 0.0); // Catmull-Rom overshoots a little at sharp edges
+}
+
+vec3 massOf(sampler2D T, vec2 g) { return uFilter == 1 ? catrom(T, g) : linOf(T, g); }
+vec3 mass3(vec2 g) {
+  vec3 m = massOf(uState, g);
+  return uBlend < 0.999 ? mix(massOf(uPrev, g), m, uBlend) : m;
+}
+
+// Phase as a unit vector (θ wraps, so it can't be filtered directly); returns cos θ.
+float phase(vec2 g) {
   vec2 q = g - 0.5;
   ivec2 i0 = ivec2(floor(q));
   vec2 f = fract(q);
-  vec4 s00 = at(i0), s10 = at(i0 + ivec2(1, 0)), s01 = at(i0 + ivec2(0, 1)), s11 = at(i0 + ivec2(1, 1));
-  vec3 rgb = mix(mix(s00.rgb, s10.rgb, f.x), mix(s01.rgb, s11.rgb, f.x), f.y);
-  // Phase as a unit vector (θ wraps, so it can't be filtered directly); returned as cos θ.
-  vec2 p = mix(mix(vec2(cos(TAU * s00.a), sin(TAU * s00.a)), vec2(cos(TAU * s10.a), sin(TAU * s10.a)), f.x),
-               mix(vec2(cos(TAU * s01.a), sin(TAU * s01.a)), vec2(cos(TAU * s11.a), sin(TAU * s11.a)), f.x), f.y);
-  return vec4(rgb, p.x);
+  float a00 = TAU * at(i0).a, a10 = TAU * at(i0 + ivec2(1, 0)).a, a01 = TAU * at(i0 + ivec2(0, 1)).a, a11 = TAU * at(i0 + ivec2(1, 1)).a;
+  vec2 p = mix(mix(vec2(cos(a00), sin(a00)), vec2(cos(a10), sin(a10)), f.x),
+               mix(vec2(cos(a01), sin(a01)), vec2(cos(a11), sin(a11)), f.x), f.y);
+  return p.x;
+}
+
+vec4 auxAt(vec2 g) {
+  vec2 q = g - 0.5;
+  ivec2 i0 = ivec2(floor(q));
+  vec2 f = fract(q);
+  return mix(mix(aux(i0), aux(i0 + ivec2(1, 0)), f.x), mix(aux(i0 + ivec2(0, 1)), aux(i0 + ivec2(1, 1)), f.x), f.y);
 }
 
 vec3 tint(vec3 m) { return m.r * uCol[0] + m.g * uCol[1] + m.b * uCol[2]; }
+
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
 
 void main() {
   vec2 uv = gl_FragCoord.xy / uView;
   uv.y = 1.0 - uv.y;
   vec2 g = uv * vec2(uSize);
-  vec4 s = bilinear(g);
-  vec3 m = s.rgb;
+  vec3 m = mass3(g);
   float mass = m.r + m.g + m.b;
-  // Gradient magnitude of the mass (one cell apart): edges, ribs, symmetry lines.
-  float ex = dot(bilinear(g + vec2(1.0, 0.0)).rgb - bilinear(g - vec2(1.0, 0.0)).rgb, vec3(1.0));
-  float ey = dot(bilinear(g + vec2(0.0, 1.0)).rgb - bilinear(g - vec2(0.0, 1.0)).rgb, vec3(1.0));
-  float edge = length(vec2(ex, ey));
-  // Halo: mass a few cells around.
-  float halo = 0.0;
-  for (int i = 0; i < 8; i++) {
-    float a = float(i) * TAU / 8.0;
-    vec3 h = at(ivec2(g + 6.0 * vec2(cos(a), sin(a)))).rgb;
-    halo += h.r + h.g + h.b;
-  }
-  halo /= 8.0;
 
-  vec3 vacuum = vec3(0.012, 0.016, 0.031);
-  vec3 indigo = vec3(0.118, 0.106, 0.294);
+  // Gradient of the mass, one cell apart. Relief weights the channels differently, so organelles
+  // of different species stand at different heights.
+  vec3 hw = vec3(1.0, 1.0 + 0.35 * uRelief, 1.0 + 0.7 * uRelief);
+  float gx = dot(mass3(g + vec2(1.0, 0.0)) - mass3(g - vec2(1.0, 0.0)), hw);
+  float gy = dot(mass3(g + vec2(0.0, 1.0)) - mass3(g - vec2(0.0, 1.0)), hw);
+  float edge = length(vec2(gx, gy));
+  // y runs down the screen; the light comes from the upper left.
+  vec3 normal = normalize(vec3(-gx * 0.9, gy * 0.9, 1.0));
+
+  // Halo: mass on two rings around this point.
+  float halo = 0.0;
+  for (int i = 0; i < 12; i++) {
+    float a = float(i) * TAU / 12.0;
+    vec2 dir = vec2(cos(a), sin(a));
+    vec3 h1 = lin(g + 0.75 * uHaloR * dir), h2 = lin(g + 1.6 * uHaloR * dir);
+    halo += (h1.r + h1.g + h1.b) * 0.65 + (h2.r + h2.g + h2.b) * 0.35;
+  }
+  halo /= 12.0;
+
+  vec4 ax = auxAt(g);
   vec3 body = tint(m) / max(mass, 1e-3);
-  float gene = aux(ivec2(g)).x;
-  body = mix(body, gene > 0.0 ? body.gbr : body.brg, 0.35 * abs(gene) * uGeneTint);
-  vec3 col = vacuum + indigo * smoothstep(0.0, 0.5, halo) * 0.8;
-  col += body * smoothstep(0.02, 0.8, mass) * 0.75;
-  col += mix(body, vec3(1.0), 0.2) * smoothstep(0.1, 0.9, edge) * 0.45;
-  col += body * 0.12 * mass * pow(0.5 + 0.5 * s.a, 4.0); // phase crests inside bodies
+  body = mix(body, ax.x > 0.0 ? body.gbr : body.brg, uGeneTint * abs(ax.x));
+
+  vec2 lens = uv - 0.5;
+  vec3 col = uBg * (1.0 - 0.7 * uVignette * dot(lens, lens));
+  col += uHaloCol * smoothstep(0.0, 0.5, halo) * uHalo;
+
+  vec3 L = normalize(vec3(-0.6, 0.6, 0.5));
+  float dic = dot(normal, L) * 0.5 + 0.5;
+  col += body * smoothstep(0.02, 0.8, mass) * uBody * mix(1.0, 0.45 + 0.55 * dic, uRelief);
+
+  vec3 irid = 0.5 + 0.5 * cos(TAU * (mass * 0.8 + normal.xyx * 1.5 + vec3(0.0, 0.33, 0.67)));
+  vec3 rim = mix(mix(body, vec3(1.0), 0.2), mix(body, irid, 0.6), uIrid);
+  float pellicle = smoothstep(0.08, 0.18, mass) * (1.0 - smoothstep(0.18, 0.32, mass));
+  col += rim * (smoothstep(0.1, 0.9, edge) * uEdge + pellicle * uPellicle);
+
+  col += body * uCrests * mass * pow(0.5 + 0.5 * phase(g), 4.0);
+  col += mix(body, vec3(1.0, 0.98, 0.9), 0.5) * smoothstep(0.9, 1.6, mass) * uNucleus;
+  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));
+  col += vec3(0.85, 0.95, 1.0) * pow(max(0.0, dot(normal, H)), 28.0) * smoothstep(0.05, 0.3, mass) * uSpec;
+  col += vec3(0.2, 0.8, 1.0) * clamp(ax.y * 0.15, 0.0, 0.3) * mass * uVort;
+
+  col *= uExposure;
+  col = mix(col, col / (1.0 + col * 0.25), uTone);
+  col += (hash12(gl_FragCoord.xy) - 0.5) * 0.012 * uGrain;
   o = vec4(col, 1.0);
 }`;
 
@@ -356,7 +453,8 @@ function compile(gl: WebGL2RenderingContext, fs: string): WebGLProgram {
 }
 
 export interface Stamp {
-  kind: 'patch' | 'ring' | 'erase';
+  /** ripple: phase is the phase kick (cycles), m the harmonic, width the ring width. */
+  kind: 'patch' | 'ring' | 'erase' | 'stir' | 'ripple' | 'clone';
   x: number;
   y: number;
   size: number;
@@ -368,6 +466,8 @@ export interface Stamp {
   winding?: number;
   /** Genome in [-1,1] given to the cells this stamp seeds. */
   genome?: number;
+  /** stir: how far (cells) matter at the centre is dragged; clone: offset to the source. */
+  drag?: [number, number];
 }
 
 export interface FieldStats {
@@ -377,8 +477,6 @@ export interface FieldStats {
   activity: number;
 }
 
-/** Channel colours: A electric cyan #06b6d4, B magenta #ec4899, C solar gold #f59e0b. */
-export const CHANNEL_COLOURS: [number, number, number][] = [[0.024, 0.714, 0.831], [0.925, 0.282, 0.6], [0.961, 0.62, 0.043]];
 
 export class MorphoGL {
   private readonly gl: WebGL2RenderingContext;
@@ -401,6 +499,10 @@ export class MorphoGL {
   private cur = 0;
   private pending: Stamp[] = [];
   regime!: Regime;
+  display: DisplaySettings = DEFAULT_SETTINGS.display;
+  /** Brightness multiplier for crossfades (0 = black). */
+  dim = 1;
+  private timer: { ext: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number } | null; open: WebGLQuery | null; pending: WebGLQuery[]; ns: number };
   used: [boolean, boolean, boolean] = [true, true, true];
   W = 0;
   H = 0;
@@ -410,6 +512,7 @@ export class MorphoGL {
     if (!gl) throw new Error('WebGL2 is not available');
     if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('Float render targets are not available');
     this.gl = gl;
+    this.timer = { ext: gl.getExtension('EXT_disjoint_timer_query_webgl2'), open: null, pending: [], ns: 0 };
     this.progs = { occ: compile(gl, OCC_FS), near: compile(gl, NEAR_FS), field: compile(gl, FIELD_FS), step: compile(gl, STEP_FS), stamp: compile(gl, STAMP_FS), stats: compile(gl, STATS_FS), show: compile(gl, SHOW_FS) };
     gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
@@ -428,22 +531,27 @@ export class MorphoGL {
   setRegime(reg: Regime): void {
     if (reg.kernels.length > MAX_KERNELS) throw new Error(`at most ${MAX_KERNELS} kernels`);
     const gl = this.gl;
+    // Same kernels and radius as last time (only the flow/phase knobs moved): keep the kernel texture.
+    const sameLaw = this.kern && this.regime && this.regime.kernels === reg.kernels && this.regime.R === reg.R;
     this.regime = reg;
     this.used = [0, 1, 2].map((c) => reg.kernels.some((k) => k.c1 === c)) as [boolean, boolean, boolean];
-    const n = (2 * reg.R + 1) ** 2;
+    const Rc = reach(reg.R);
+    const n = (2 * Rc + 1) ** 2;
     const groups = Math.ceil(reg.kernels.length / 4);
-    const data = new Float32Array(n * groups * 4);
-    reg.kernels.forEach((k, j) => {
-      const w = kernelWeights(reg.R, k);
-      const g = j >> 2, lane = j & 3;
-      for (let i = 0; i < n; i++) data[(g * n + i) * 4 + lane] = w[i];
-    });
-    if (this.kern) gl.deleteTexture(this.kern);
-    this.kern = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, this.kern);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, n, groups, 0, gl.RGBA, gl.FLOAT, data);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    if (!sameLaw) {
+      const data = new Float32Array(n * groups * 4);
+      reg.kernels.forEach((k, j) => {
+        const w = kernelWeights(reg.R, k);
+        const g = j >> 2, lane = j & 3;
+        for (let i = 0; i < n; i++) data[(g * n + i) * 4 + lane] = w[i];
+      });
+      if (this.kern) gl.deleteTexture(this.kern);
+      this.kern = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, this.kern);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, n, groups, 0, gl.RGBA, gl.FLOAT, data);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    }
 
     const f = this.progs.field;
     gl.useProgram(f);
@@ -455,14 +563,14 @@ export class MorphoGL {
     });
     gl.uniform4fv(this.u(f, 'uSrc'), src);
     gl.uniform4fv(this.u(f, 'uGrow'), grow);
-    gl.uniform1i(this.u(f, 'uR'), reg.R);
+    gl.uniform1i(this.u(f, 'uR'), Rc);
     gl.uniform1i(this.u(f, 'uGroups'), groups);
     gl.uniform1f(this.u(f, 'uDmu'), 0);
     gl.uniform1f(this.u(f, 'uSpec'), reg.speciation ?? 0);
     gl.uniform1f(this.u(f, 'uVortMu'), reg.vortexMu ?? 0);
     const p = this.progs.step;
     gl.useProgram(p);
-    gl.uniform1i(this.u(p, 'uR'), reg.R);
+    gl.uniform1i(this.u(p, 'uR'), Rc);
     gl.uniform1f(this.u(p, 'uFlow'), reg.flow ?? 0);
     gl.uniform1f(this.u(p, 'uCurl'), reg.curl ?? 0);
     gl.uniform1f(this.u(p, 'uSpec'), reg.speciation ?? 0);
@@ -470,6 +578,7 @@ export class MorphoGL {
     gl.uniform1f(this.u(p, 'uOmega'), reg.omega);
     gl.uniform1f(this.u(p, 'uSync'), reg.sync);
     gl.uniform1f(this.u(p, 'uSwirl'), reg.swirl);
+    gl.uniform3f(this.u(p, 'uUsed'), ...(this.used.map(Number) as [number, number, number]));
     const ring: number[] = [];
     for (let i = 0; i < RING_TAPS; i++) {
       const r = (reg.R * (1 + Math.floor(i / 8))) / 3, a = (i % 8) * Math.PI / 4 + (i >= 8 && i < 16 ? Math.PI / 8 : 0);
@@ -596,8 +705,8 @@ export class MorphoGL {
       const a: number[] = [], b: number[] = [], c: number[] = [], g: number[] = [];
       for (const s of batch) {
         g.push(s.genome ?? 0);
-        a.push(s.x, s.y, s.size, s.kind === 'patch' ? 0 : s.kind === 'ring' ? 1 : 2);
-        b.push(s.m ?? 0, s.phase ?? 0, s.width ?? 1, Math.floor(this.rand() * 60000));
+        a.push(s.x, s.y, s.size, ['patch', 'ring', 'erase', 'stir', 'ripple', 'clone'].indexOf(s.kind));
+        b.push(s.drag ? s.drag[0] : s.m ?? 0, s.drag ? s.drag[1] : s.phase ?? 0, s.width ?? 1, Math.floor(this.rand() * 60000));
         c.push(...(s.amp ?? [0, 0, 0]), s.winding ?? 0);
       }
       const p = this.progs.stamp;
@@ -638,7 +747,7 @@ export class MorphoGL {
     gl.bindTexture(gl.TEXTURE_2D, this.occTex[0]);
     gl.uniform1i(this.u(nr, 'uOcc'), 0);
     gl.uniform2i(this.u(nr, 'uCSize'), this.CW, this.CH);
-    gl.uniform1i(this.u(nr, 'uReach'), Math.ceil(this.regime.R / BLOCK) + 1);
+    gl.uniform1i(this.u(nr, 'uReach'), Math.ceil(reach(this.regime.R) / BLOCK) + 1);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.occFb[1]);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -655,7 +764,7 @@ export class MorphoGL {
     gl.bindTexture(gl.TEXTURE_2D, this.occTex[0]);
     gl.uniform1i(this.u(f, 'uOcc'), 5);
     gl.uniform1i(this.u(f, 'uBlock'), BLOCK);
-    gl.uniform1i(this.u(f, 'uReach'), Math.ceil(this.regime.R / BLOCK) + 1);
+    gl.uniform1i(this.u(f, 'uReach'), Math.ceil(reach(this.regime.R) / BLOCK) + 1);
     gl.viewport(0, 0, this.W, this.H);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fieldFb);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -672,6 +781,52 @@ export class MorphoGL {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbs[1 - this.cur]);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     this.cur = 1 - this.cur;
+  }
+
+  /** Whether the GPU can time its own work (EXT_disjoint_timer_query_webgl2). */
+  get canTime(): boolean { return !!this.timer.ext; }
+
+  /** Brackets one frame's GPU work; results arrive a few frames later through gpuNs(). */
+  beginTiming(): void {
+    const t = this.timer;
+    if (!t.ext || t.open || t.pending.length > 6) return;
+    t.open = this.gl.createQuery();
+    if (t.open) this.gl.beginQuery(t.ext.TIME_ELAPSED_EXT, t.open);
+  }
+  endTiming(): void {
+    const t = this.timer;
+    if (!t.ext || !t.open) return;
+    this.gl.endQuery(t.ext.TIME_ELAPSED_EXT);
+    t.pending.push(t.open);
+    t.open = null;
+  }
+  /** GPU nanoseconds finished since the last call (whole frames only), or null if timing is unavailable. */
+  gpuNs(): number | null {
+    const t = this.timer, gl = this.gl;
+    if (!t.ext) return null;
+    const disjoint = gl.getParameter(t.ext.GPU_DISJOINT_EXT);
+    let ns = 0;
+    while (t.pending.length && gl.getQueryParameter(t.pending[0], gl.QUERY_RESULT_AVAILABLE)) {
+      const q = t.pending.shift()!;
+      if (!disjoint) ns += gl.getQueryParameter(q, gl.QUERY_RESULT) as number;
+      gl.deleteQuery(q);
+    }
+    return ns;
+  }
+
+  /**
+   * The centre of a well-populated stats block (from the last stats() read), chosen at random among
+   * the densest few, or null if nothing lives. Good enough to find an organism to copy.
+   */
+  findLife(): [number, number] | null {
+    const b = this.lastBlocks;
+    if (!b) return null;
+    const idx: number[] = [];
+    for (let i = 0; i < b.length / 4; i++) if (b[i * 4 + 3] > 0.15) idx.push(i);
+    if (!idx.length) return null;
+    idx.sort((i, j) => b[j * 4 + 3] - b[i * 4 + 3]);
+    const i = idx[Math.floor(this.rand() * Math.min(6, idx.length))];
+    return [((i % STATS_W) + 0.5) * (this.W / STATS_W), (Math.floor(i / STATS_W) + 0.5) * (this.H / this.statsH)];
   }
 
   /** Reads the coarse statistics back (a small synchronous read; call every few dozen steps). */
@@ -698,14 +853,28 @@ export class MorphoGL {
     return { cover: cover / n, mass: mass.map((v) => v / n) as [number, number, number], activity: (act / n) * 1000 };
   }
 
-  draw(width: number, height: number): void {
+  /** `blend` < 1 shows the world that far between the previous step and the current one. */
+  draw(width: number, height: number, blend = 1): void {
     const gl = this.gl;
     const p = this.progs.show;
     gl.useProgram(p);
     this.bindState(p);
     gl.uniform2f(this.u(p, 'uView'), width, height);
-    gl.uniform3fv(this.u(p, 'uCol'), CHANNEL_COLOURS.flat());
-    gl.uniform1f(this.u(p, 'uGeneTint'), this.regime.speciation ? 1 : 0);
+    const d = this.display;
+    gl.uniform3fv(this.u(p, 'uCol'), d.colours.flat());
+    gl.uniform3fv(this.u(p, 'uBg'), d.background);
+    gl.uniform3fv(this.u(p, 'uHaloCol'), d.haloColour);
+    gl.uniform1i(this.u(p, 'uFilter'), d.filter === 'bicubic' ? 1 : 0);
+    const f = (name: string, v: number) => gl.uniform1f(this.u(p, name), v);
+    f('uExposure', d.exposure * this.dim); f('uBody', d.body); f('uEdge', d.edge); f('uHalo', d.halo); f('uHaloR', d.haloRadius);
+    f('uCrests', d.crests); f('uRelief', d.relief); f('uIrid', d.iridescence); f('uSpec', d.specular);
+    f('uPellicle', d.pellicle); f('uNucleus', d.nucleus); f('uVort', d.vorticity);
+    f('uGeneTint', this.regime.speciation ? d.geneTint : 0);
+    gl.activeTexture(gl.TEXTURE6);
+    gl.bindTexture(gl.TEXTURE_2D, this.tex[1 - this.cur]);
+    gl.uniform1i(this.u(p, 'uPrev'), 6);
+    f('uBlend', blend);
+    f('uTone', d.tonemap); f('uGrain', d.grain); f('uVignette', d.vignette);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, width, height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);

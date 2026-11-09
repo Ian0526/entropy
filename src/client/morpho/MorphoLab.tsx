@@ -1,24 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeft, Maximize, Minimize, RotateCcw, Shuffle, Sparkles } from 'lucide-react';
 import MorphoCanvas, { type MorphoControl, type MorphoStatus } from './MorphoCanvas';
-import { CHANNEL_COLOURS } from './MorphoGL';
 import { growth, REGIMES, regimeById, shell, type Regime } from './regimes';
+import { decodeSettings, loadSettings, saveSettings, type MorphoSettings, type Rgb } from './settings';
+import { ControlsPanel, LookPanel } from './SettingsPanel';
 import { cx, Glass, SectionTitle } from '../../components/ui';
 
 const IDLE_MS = 8000;
-const css = (c: [number, number, number]) => `rgb(${c.map((v) => Math.round(v * 255)).join(',')})`;
+const css = (c: Rgb) => `rgb(${c.map((v) => Math.round(v * 255)).join(',')})`;
 const CH = ['A', 'B', 'C'];
+const TABS = [['world', 'World'], ['look', 'Look'], ['controls', 'Controls']] as const;
+type Tab = (typeof TABS)[number][0];
 
 /**
  * /morpho: the Morphogenesis lab. The world fills the screen; the HUD fades out after 8 s without
  * input (and the cursor with it) and comes back on any movement. Screensaver mode (button, F11 or
  * F) goes fullscreen with the HUD hidden. A small watermark always shows the regime, the last
  * nucleated eigenmode and the latest quantum nonce.
+ * Look and Controls hold the viewer's settings (settings.ts), saved in this browser; ?s=… loads a
+ * shared set, and Controls → Wallpaper gives the command that runs them on the desktop.
  */
 export default function MorphoLab() {
   const q = new URLSearchParams(window.location.search);
   const [regime, setRegime] = useState<Regime>(() => regimeById(q.get('regime')));
-  const [auto, setAuto] = useState(true);
+  const [auto, setAuto] = useState(q.get('auto') !== '0');
+  const [settings, setSettingsState] = useState<MorphoSettings>(() => decodeSettings(q.get('s')) ?? loadSettings());
+  const setSettings = useCallback((s: MorphoSettings) => { setSettingsState(s); saveSettings(s); }, []);
+  const [tab, setTab] = useState<Tab>('world');
   const [status, setStatus] = useState<MorphoStatus | null>(null);
   const [idle, setIdle] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
@@ -60,7 +68,8 @@ export default function MorphoLab() {
 
   const onStatus = useCallback((s: MorphoStatus) => {
     setStatus(s);
-    setRegime((r) => (r.id === s.regime.id ? r : s.regime));
+    // Mid-morph the world still reports the old law; keep showing where it is going.
+    if (!s.morphingTo) setRegime((r) => (r.id === s.regime.id ? r : s.regime));
   }, []);
 
   const pick = (r: Regime) => {
@@ -70,10 +79,10 @@ export default function MorphoLab() {
 
   return (
     <div className={cx('relative h-[100dvh] w-[100dvw] overflow-hidden bg-[#02040b] text-slate-200', idle && 'cursor-none')}>
-      <MorphoCanvas regime={regime.id} auto={auto} cellPx={3} onStatus={onStatus} control={control} />
+      <MorphoCanvas regime={regime.id} auto={auto} settings={settings} onStatus={onStatus} control={control} />
 
       <div className={cx('pointer-events-none absolute inset-0 transition-opacity duration-1000', idle ? 'opacity-0' : 'opacity-100')}>
-        <div className="absolute left-4 top-4 bottom-4 flex w-[min(340px,calc(100vw-2rem))] flex-col">
+        <div data-hud className="absolute left-4 top-4 bottom-4 flex w-[min(340px,calc(100vw-2rem))] flex-col">
           <Glass className={cx('tl-scroll flex min-h-0 flex-col gap-4 overflow-y-auto p-4', idle && 'pointer-events-none')}>
             <div className="flex items-center justify-between gap-2">
               <div>
@@ -85,6 +94,19 @@ export default function MorphoLab() {
               </a>
             </div>
 
+            <div className="flex gap-1 rounded-xl border border-slate-800 bg-slate-900/50 p-1">
+              {TABS.map(([id, label]) => (
+                <button key={id} type="button" onClick={() => setTab(id)}
+                  className={cx('flex-1 rounded-lg px-2 py-1 text-xs transition', tab === id ? 'bg-slate-700/70 text-white' : 'text-slate-400 hover:text-slate-200')}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {tab === 'look' && <LookPanel settings={settings} onChange={setSettings} />}
+            {tab === 'controls' && <ControlsPanel settings={settings} onChange={setSettings} regime={regime} auto={auto} />}
+
+            {tab === 'world' && <>
             <div>
               <SectionTitle>Regime</SectionTitle>
               <div className="space-y-1.5">
@@ -109,9 +131,10 @@ export default function MorphoLab() {
               <input type="checkbox" checked={auto} onChange={(e) => { setAuto(e.target.checked); control.current?.setAuto(e.target.checked); }} />
             </label>
 
-            <KernelPreview regime={regime} />
+            <KernelPreview regime={regime} colours={status?.display.colours ?? settings.display.colours} />
 
             {status && <Vitals status={status} />}
+            </>}
           </Glass>
         </div>
       </div>
@@ -134,7 +157,7 @@ function ActionButton({ icon, label, title, onClick }: { icon: React.ReactNode; 
 }
 
 /** K(r) of every kernel (each scaled to its own peak) and its growth curve G(U). */
-function KernelPreview({ regime }: { regime: Regime }) {
+function KernelPreview({ regime, colours }: { regime: Regime; colours: [Rgb, Rgb, Rgb] }) {
   const W = 300, H = 92, pad = 4;
   const kPaths = regime.kernels.map((k) => {
     const pts: number[] = [];
@@ -158,20 +181,20 @@ function KernelPreview({ regime }: { regime: Regime }) {
       <div>
         <SectionTitle right={<span className="text-[10px] text-slate-500">r = 0 … R={regime.R}</span>}>Kernel K(r)</SectionTitle>
         <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-lg border border-slate-800 bg-slate-950/60">
-          {kPaths.map((d, i) => <path key={i} d={d} fill="none" stroke={css(CHANNEL_COLOURS[regime.kernels[i].c1])} strokeOpacity={opacity} strokeWidth={1.3} />)}
+          {kPaths.map((d, i) => <path key={i} d={d} fill="none" stroke={css(colours[regime.kernels[i].c1])} strokeOpacity={opacity} strokeWidth={1.3} />)}
         </svg>
       </div>
       <div>
         <SectionTitle right={<span className="text-[10px] text-slate-500">U = 0 … {uMax}</span>}>Growth G(U)</SectionTitle>
         <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-lg border border-slate-800 bg-slate-950/60">
           <line x1={pad} x2={W - pad} y1={H / 2} y2={H / 2} stroke="#334155" strokeDasharray="3 3" />
-          {gPaths.map((d, i) => <path key={i} d={d} fill="none" stroke={css(CHANNEL_COLOURS[regime.kernels[i].c1])} strokeOpacity={opacity} strokeWidth={1.3} />)}
+          {gPaths.map((d, i) => <path key={i} d={d} fill="none" stroke={css(colours[regime.kernels[i].c1])} strokeOpacity={opacity} strokeWidth={1.3} />)}
         </svg>
       </div>
       <p className="text-[11px] leading-snug text-slate-500">
         Each cell grows only when the ring-weighted mass around it lands inside a growth band (G &gt; 0, above the dashed line)
         and decays everywhere else. A narrow band admits only a few self-consistent shapes; the rings decide which. Colour = the
-        channel a kernel feeds ({CH.map((c, i) => <span key={c} style={{ color: css(CHANNEL_COLOURS[i]) }}>{c} </span>)}).
+        channel a kernel feeds ({CH.map((c, i) => <span key={c} style={{ color: css(colours[i]) }}>{c} </span>)}).
       </p>
     </div>
   );
@@ -185,7 +208,11 @@ function Vitals({ status }: { status: MorphoStatus }) {
         <Stat label="coverage" value={`${(status.cover * 100).toFixed(1)}%`} />
         <Stat label="activity" value={status.activity.toFixed(1)} />
         <Stat label="quantum" value={`${(status.quantumShare * 100).toFixed(0)}%`} />
+        <Stat label="gpu" value={status.gpu === null ? 'n/a' : `${Math.round(status.gpu * 100)}%`} />
+        <Stat label="step rate" value={`${Math.round(status.stepScale * 100)}%`} />
+        <Stat label="morph" value={status.morphingTo ? '→' : '–'} />
       </div>
+      {status.morphingTo && <div className="mt-1.5 text-[11px] text-sky-300">morphing into {status.morphingTo}</div>}
       <ul className="mt-2 space-y-0.5 font-mono text-[10px] text-slate-500">
         {status.events.map((e) => <li key={`${e.step}-${e.text}`}><span className="text-slate-600">{e.step}</span> {e.text}</li>)}
       </ul>
