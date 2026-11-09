@@ -14,6 +14,8 @@ interface Props {
   onInspect: (x: number, y: number) => void;
   onFps: (fps: number) => void;
   onRenderer?: (kind: Renderer['kind']) => void;
+  /** Fill the screen with one copy of the world (cropping a sliver if the aspect differs), refitting on resize. */
+  cover?: boolean;
 }
 
 const MIN_ZOOM = 0.5;
@@ -47,7 +49,9 @@ export default function SimulationCanvas(props: Props) {
       if (!gridW) return;
       cam.cx = gridW / 2;
       cam.cy = gridH / 2;
-      cam.zoom = Math.max(MIN_ZOOM, Math.min(cssW / gridW, cssH / gridH) * 0.98);
+      cam.zoom = propsRef.current.cover
+        ? Math.max(cssW / gridW, cssH / gridH)
+        : Math.max(MIN_ZOOM, Math.min(cssW / gridW, cssH / gridH) * 0.98);
     };
 
     const resize = () => {
@@ -55,6 +59,7 @@ export default function SimulationCanvas(props: Props) {
       cssW = Math.max(1, r.width);
       cssH = Math.max(1, r.height);
       renderer.resize(cssW, cssH, Math.min(window.devicePixelRatio || 1, 2));
+      if (propsRef.current.cover) fitted = false;
     };
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);

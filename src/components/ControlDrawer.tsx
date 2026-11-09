@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Box, ChevronLeft, ChevronRight, Cloud, Cpu, Dna, Layers, MessageSquareText, RotateCcw, SlidersHorizontal, Square } from 'lucide-react';
+import { Box, ChevronLeft, ChevronRight, Cloud, Cpu, Dna, Flower2, Layers, MessageSquareText, RotateCcw, SlidersHorizontal, Square } from 'lucide-react';
 import { DEFAULT_PARAMS, type SimParams, type WorldId } from '../engine/protocol';
 import { LAYERS, type LayerWeights } from '../client/state';
 import type { SourceKind } from '../client/useSimulation';
@@ -196,6 +196,11 @@ export default function ControlDrawer(props: {
             </div>
           )}
           <div className="flex items-center gap-0.5">
+            {open && (
+              <a href="/morpho" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-fuchsia-300" title="Morphogenesis lab: multi-channel Lenia with a phase field">
+                <Flower2 size={16} />
+              </a>
+            )}
             {open && (
               <button type="button" onClick={props.onOpenBuilder} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-emerald-300" title="Builder: suggest a change or ask a question">
                 <MessageSquareText size={16} />

@@ -343,7 +343,8 @@ export class SimulationCore {
     const [a0, a1w] = makeAncestor(q.nextUint32() & 0xffff);
     this.ancestor[0] = a0;
     this.ancestor[1] = a1w;
-    this.seedFounders(this.D > 1 ? ECO.founders3d : 10);
+    // 10 founders per 256² of flat world, so a bigger world starts as diverse per area.
+    this.seedFounders(this.D > 1 ? ECO.founders3d : Math.max(10, Math.round((10 * this.W * this.H) / 65536)));
     this.stats = this.emptyStats();
     this.refreshStats();
     this.collectSpecies();

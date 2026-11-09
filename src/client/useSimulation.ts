@@ -26,10 +26,13 @@ export interface History {
 const HISTORY_LEN = 180;
 const emptyHistory = (): History => ({ population: [], species: [], energy: [], distance: [] });
 
-export function useSimulation() {
+/** `fixed` pins the source and world and stops them being saved (the wallpaper uses it). */
+export function useSimulation(fixed?: { kind: SourceKind; world: WorldId }) {
   const [kind, setKind] = useState<SourceKind>(() =>
+    fixed ? fixed.kind :
     (typeof localStorage !== 'undefined' && localStorage.getItem('turinglife.source') === 'local') ? 'local' : 'cloud');
   const [world, setWorld] = useState<WorldId>(() =>
+    fixed ? fixed.world :
     (typeof localStorage !== 'undefined' && localStorage.getItem('turinglife.world') === '3d') ? '3d' : '2d');
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [telemetry, setTelemetry] = useState<SimTelemetry | null>(null);
@@ -43,8 +46,10 @@ export function useSimulation() {
   const lastHistTick = useRef(-1);
 
   useEffect(() => {
-    localStorage.setItem('turinglife.source', kind);
-    localStorage.setItem('turinglife.world', world);
+    if (!fixed) {
+      localStorage.setItem('turinglife.source', kind);
+      localStorage.setItem('turinglife.world', world);
+    }
     frameRef.current = { data: null, width: 0, height: 0, depth: 1, tick: 0, version: frameRef.current.version + 1 };
     lastHistTick.current = -1;
     setHistory(emptyHistory());
