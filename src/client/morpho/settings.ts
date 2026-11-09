@@ -243,10 +243,11 @@ export function encodeSettings(s: MorphoSettings): string {
   const b64 = btoa(JSON.stringify(round(s)));
   return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
+/** Reads a settings code. A pinned regime may follow after a dot ("code.regimeId"); see codeRegime. */
 export function decodeSettings(str: string | null): MorphoSettings | null {
   if (!str) return null;
   try {
-    return normalise(JSON.parse(atob(str.replace(/-/g, '+').replace(/_/g, '/'))));
+    return normalise(JSON.parse(atob(str.split('.')[0].replace(/-/g, '+').replace(/_/g, '/'))));
   } catch {
     return null;
   }

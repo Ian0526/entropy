@@ -4,3 +4,7 @@ dist
 .env
 .playwright-mcp
 data/
+desktop/TuringLife/bin
+desktop/TuringLife/obj
+desktop/TuringLife/web.zip
+desktop/dist

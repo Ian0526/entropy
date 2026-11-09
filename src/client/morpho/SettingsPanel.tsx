@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Check, Copy, Gauge, RotateCcw, Waves } from 'lucide-react';
 import { Pill, SectionTitle, Slider } from '../../components/ui';
 import type { Regime } from './regimes';
+import { DOWNLOAD_URL } from '../links';
 import {
   DEFAULT_SETTINGS, DRIFT_RANGES, driftRange, encodeSettings, fromHex, hex, LOOKS, PALETTES,
   type DisplaySettings, type DriftSettings, type InteractionSettings, type MorphoSettings, type PhysicsOverrides, type Rgb,
@@ -123,9 +124,10 @@ export function ControlsPanel({ settings, onChange, regime, auto }: { settings: 
   };
 
   const [copied, setCopied] = useState(false);
-  const cmd = `powershell -ExecutionPolicy Bypass -File scripts\\wallpaper\\start.ps1${auto ? '' : ` -Regime ${regime.id}`} -CellPx ${settings.cellPx} -Settings ${encodeSettings(settings)}`;
+  // A settings code the desktop app imports (Import code); a pinned regime rides along after a dot.
+  const code = encodeSettings(settings) + (auto ? '' : `.${regime.id}`);
   const copy = () => {
-    void navigator.clipboard.writeText(cmd).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
+    void navigator.clipboard.writeText(code).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
   };
 
   const dr = settings.drift;
@@ -217,13 +219,15 @@ export function ControlsPanel({ settings, onChange, regime, auto }: { settings: 
         <p className="text-[11px] leading-snug text-slate-500">Overrides apply to every regime, the Director's drifts included. Big values can flood or kill a world; the Director will reseed it.</p>
       </div>
       <div>
-        <SectionTitle>Wallpaper</SectionTitle>
+        <SectionTitle>Desktop wallpaper</SectionTitle>
         <p className="mb-1.5 text-[11px] leading-snug text-slate-500">
-          Runs these settings behind your desktop icons{auto ? ', drifting between regimes' : `, pinned to ${regime.name}`}. Run from the repo folder:
+          <a href={DOWNLOAD_URL} className="text-emerald-300 hover:underline">Download the Windows app</a> to run this world behind
+          your desktop icons. To take these settings along{auto ? '' : ` (pinned to ${regime.name})`}, copy this code and use
+          Import code in the app.
         </p>
-        <div className="max-h-20 overflow-y-auto break-all rounded-lg border border-slate-800 bg-slate-950/70 p-2 font-mono text-[10px] text-slate-400">{cmd}</div>
+        <div className="max-h-20 overflow-y-auto break-all rounded-lg border border-slate-800 bg-slate-950/70 p-2 font-mono text-[10px] text-slate-400">{code}</div>
         <div className="mt-1.5 flex gap-1.5">
-          <Pill onClick={copy}>{copied ? <Check size={12} /> : <Copy size={12} />}{copied ? 'Copied' : 'Copy command'}</Pill>
+          <Pill onClick={copy}>{copied ? <Check size={12} /> : <Copy size={12} />}{copied ? 'Copied' : 'Copy settings code'}</Pill>
           <Pill onClick={() => onChange(DEFAULT_SETTINGS)} title="Every setting back to its default">
             <RotateCcw size={12} />Reset all
           </Pill>

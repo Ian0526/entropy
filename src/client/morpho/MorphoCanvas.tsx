@@ -4,7 +4,7 @@ import { Director, type DirectorEvent } from './director';
 import { regimeById, regimeCost, type Regime } from './regimes';
 import { Drifter, physicsOf } from './drift';
 import { DEFAULT_SETTINGS, type MorphoSettings } from './settings';
-import { QuantumDice } from '../smoothlife/quantumDice';
+import { QuantumDice } from './quantumDice';
 
 export interface MorphoStatus {
   regime: Regime;
@@ -32,6 +32,8 @@ export interface MorphoControl {
   reseed(): void;
   nucleate(): void;
   setAuto(auto: boolean): void;
+  /** A pointer position in page pixels from outside the page (the desktop app relays the mouse). */
+  pointer(clientX: number, clientY: number): void;
 }
 
 /** Pointer events over these (the lab's panels and controls) don't touch the world. */
@@ -118,10 +120,11 @@ export default function MorphoCanvas({ regime, auto = true, settings = DEFAULT_S
       reseed: () => { sim.reset(sim.W, sim.H); director.populate(); },
       nucleate: () => director.nucleate('rings'),
       setAuto: (a) => { userAuto = a; },
+      pointer: (x, y) => moveTo(x, y, false),
     };
 
     // The pointer, in grid cells. Movement is gathered per frame and applied as one stamp.
-    const toGrid = (e: PointerEvent): [number, number] => {
+    const toGrid = (e: { clientX: number; clientY: number }): [number, number] => {
       const r = canvas.getBoundingClientRect();
       return [((e.clientX - r.left) / r.width) * sim.W, ((e.clientY - r.top) / r.height) * sim.H];
     };
@@ -129,12 +132,13 @@ export default function MorphoCanvas({ regime, auto = true, settings = DEFAULT_S
     let drag: [number, number] = [0, 0];
     let lastRipple = 0;
     const overUi = (e: PointerEvent) => e.target instanceof Element && !!e.target.closest(UI);
-    const onMove = (e: PointerEvent) => {
+    const moveTo = (clientX: number, clientY: number, ui: boolean) => {
       if (!started || !sim.W) return;
-      const p = toGrid(e);
-      if (ptr && !overUi(e)) { drag[0] += p[0] - ptr[0]; drag[1] += p[1] - ptr[1]; }
+      const p = toGrid({ clientX, clientY });
+      if (ptr && !ui) { drag[0] += p[0] - ptr[0]; drag[1] += p[1] - ptr[1]; }
       ptr = p;
     };
+    const onMove = (e: PointerEvent) => moveTo(e.clientX, e.clientY, overUi(e));
     const onLeave = () => { ptr = null; drag = [0, 0]; };
     const onDown = (e: PointerEvent) => {
       if (!started || !sim.W || e.button !== 0 || overUi(e)) return;

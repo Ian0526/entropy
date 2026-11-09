@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowLeft, Maximize, Minimize, RotateCcw, Shuffle, Sparkles } from 'lucide-react';
+import { CodeXml, Download, Maximize, Minimize, RotateCcw, Shuffle, Sparkles } from 'lucide-react';
+import { DOWNLOAD_URL, REPO_URL } from '../links';
 import MorphoCanvas, { type MorphoControl, type MorphoStatus } from './MorphoCanvas';
 import { growth, REGIMES, regimeById, shell, type Regime } from './regimes';
 import { decodeSettings, loadSettings, saveSettings, type MorphoSettings, type Rgb } from './settings';
@@ -22,8 +23,10 @@ type Tab = (typeof TABS)[number][0];
  */
 export default function MorphoLab() {
   const q = new URLSearchParams(window.location.search);
-  const [regime, setRegime] = useState<Regime>(() => regimeById(q.get('regime')));
-  const [auto, setAuto] = useState(q.get('auto') !== '0');
+  // ?s= may carry a pinned regime after a dot (the desktop app's Copy code).
+  const pinned = q.get('s')?.split('.')[1];
+  const [regime, setRegime] = useState<Regime>(() => regimeById(pinned ?? q.get('regime')));
+  const [auto, setAuto] = useState(!pinned && q.get('auto') !== '0');
   const [settings, setSettingsState] = useState<MorphoSettings>(() => decodeSettings(q.get('s')) ?? loadSettings());
   const setSettings = useCallback((s: MorphoSettings) => { setSettingsState(s); saveSettings(s); }, []);
   const [tab, setTab] = useState<Tab>('world');
@@ -86,13 +89,18 @@ export default function MorphoLab() {
           <Glass className={cx('tl-scroll flex min-h-0 flex-col gap-4 overflow-y-auto p-4', idle && 'pointer-events-none')}>
             <div className="flex items-center justify-between gap-2">
               <div>
-                <div className="text-sm font-semibold tracking-wide text-slate-100">Morphogenesis</div>
-                <div className="text-[11px] text-slate-500">multi-channel Lenia · phase field · quantum seeds</div>
+                <div className="text-sm font-semibold tracking-wide text-slate-100">TuringLife · Morphogenesis</div>
+                <div className="text-[11px] text-slate-500">a living wallpaper · multi-channel Lenia · quantum seeds</div>
               </div>
-              <a href="/" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white" title="Back to TuringLife">
-                <ArrowLeft size={16} />
+              <a href={REPO_URL} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white" title="Source code on GitHub">
+                <CodeXml size={16} />
               </a>
             </div>
+            <a href={DOWNLOAD_URL}
+              className="flex items-center justify-center gap-2 rounded-xl border border-emerald-400/50 bg-emerald-400/10 px-3 py-2 text-xs font-medium text-emerald-200 hover:bg-emerald-400/20"
+              title="The desktop app: this world as your Windows wallpaper, behind the icons, with its own settings window">
+              <Download size={14} /> Download the wallpaper for Windows
+            </a>
 
             <div className="flex gap-1 rounded-xl border border-slate-800 bg-slate-900/50 p-1">
               {TABS.map(([id, label]) => (

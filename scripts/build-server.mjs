@@ -1,8 +1,8 @@
-// Bundles the Node server + simulation worker into dist/server (ESM, node_modules kept external).
+// Bundles the Node server into dist/server (ESM, node_modules kept external).
 import { build } from 'esbuild';
 
 await build({
-  entryPoints: { index: 'src/server/index.ts', simWorker: 'src/server/simWorker.ts' },
+  entryPoints: { index: 'src/server/index.ts' },
   outdir: 'dist/server',
   bundle: true,
   platform: 'node',

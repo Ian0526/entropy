@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    TuringLife Wallpaper: the Windows desktop app. Native settings window, live WebView2 preview,
+    and the world itself running in a WebView2 window behind the desktop icons.
+    Build it with `npm run desktop` from the repo root (it builds the web page first and embeds it).
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>TuringLife</AssemblyName>
+    <RootNamespace>TuringLife</RootNamespace>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Version>1.0.0</Version>
+    <Product>TuringLife Wallpaper</Product>
+    <Company>TuringLife</Company>
+    <Description>A living Morphogenesis world as your Windows wallpaper.</Description>
+    <!-- One self-contained .exe: no .NET install needed on the user's PC. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+    <!-- WebView2 ships a WPF assembly this WinForms app never loads. -->
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <!-- The built web page (dist/client, zipped by scripts/build-desktop.mjs). -->
+    <EmbeddedResource Include="web.zip" LogicalName="web.zip" Condition="Exists('web.zip')" />
+    <EmbeddedResource Include="app.ico" LogicalName="app.ico" />
+  </ItemGroup>
+</Project>

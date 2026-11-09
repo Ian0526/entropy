@@ -1,112 +1,63 @@
-# TuringLife
+# TuringLife · Morphogenesis
 
-A thermodynamic, mutable-genome cellular automaton built to show emergent agency, homeostatic healing and sensory-driven foraging. Mutation, the asynchronous update order and symmetry breaking all draw on a **hybrid quantum-entropy pool**: hardware QRNG samples (LfD / ID Quantique by default) feed an SFC32 chaotic sponge through a nonce-wrapped index jumper.
+A living wallpaper for Windows. Multi-channel Lenia organisms (three coupled species fields plus a
+phase field) grow, swim, bond into colonies and bounce apart behind your desktop icons, seeded by
+quantum random numbers from a hardware QRNG. Left alone, the world drifts: its look, colours,
+physics and even its laws ease from one random state to the next, morphing one kind of life into
+another instead of resetting.
 
-It ships as a single repo for **Railway** (CPU-only vCPUs): a Fastify server plus a `worker_threads` simulation worker, with a React 19 + WebGL2 frontend that works on desktop and mobile.
+- **Website:** a live preview with every setting, at the Railway deployment.
+- **Desktop app:** download `TuringLifeSetup.exe` from the [latest release](https://github.com/Ian0526/entropy/releases/latest).
+  Run it, choose Install, and it lives in the tray: the settings window (native controls with a live
+  preview), the world on the desktop, and Start with Windows. It installs per user (no admin), and is
+  removed from Settings → Apps like any other app. It needs the Microsoft Edge WebView2 Runtime,
+  which Windows 10 and 11 already have.
+
+## What it does
+
+- **The world** (`src/client/morpho`): GPU multi-channel Lenia in WebGL2. Each regime is a set of
+  ring kernels and growth bands (`regimes.ts`); Bert Chan's 15-kernel "aquarium" law gives the
+  Bioluminescent Protozoa. A phase field (Kuramoto oscillators) beats inside the bodies, curl flow
+  makes organisms spin, and per-organism genomes (speciation) give each colony its own hue and law.
+- **The Director** (`director.ts`) keeps an unattended world alive: it reseeds extinction, thins
+  overcrowding, stirs stagnation, and morphs between regimes by interpolating the law itself.
+- **Drift** (`drift.ts`): smooth, endless randomisation of optics, colours, physics and speed within
+  ranges you set.
+- **Load guard**: times its own GPU work and keeps within a budget (fewer steps first, down to a floor
+  you choose, then a lighter world). On the desktop, a fullscreen game or a busy GPU/CPU slows the
+  world to a crawl at a negligible load.
+- **Quantum seeds**: the LfD QRNG (an ID Quantique Quantis device, free and keyless) supplies the
+  random numbers behind seeds, genomes and the Director's choices; a seeded SFC32 generator fills in.
+
+## Build from source
+
+Needs Node 20+ and, for the desktop app, Windows with the [.NET 8 SDK](https://dotnet.microsoft.com/download).
 
 ```
+git clone https://github.com/Ian0526/entropy.git
+cd entropy
 npm install
-npm run dev        # server :8080 (tsx watch) + Vite :5173 with /ws and /api proxied
-npm run selftest   # PRNG statistics, anti-cycle guard, mock-ANU harvester, 1500-tick dynamics
-npm run build && npm start   # production: http://localhost:8080
+
+npm run dev        # the website: Vite on :5173, server on :8080 (quantum pool)
+npm run desktop    # the Windows app: desktop/dist/TuringLifeSetup.exe
+npm run build && npm start   # the website as deployed: http://localhost:8080
 ```
+
+`TuringLifeSetup.exe --portable` runs a copy without installing it.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `src/engine/QuantumEntropy.ts` | ANU cron harvester (exponential backoff on 429/timeout, cooldown-guarded manual resync), `Uint16Array(1024)` ring in a `SharedArrayBuffer`, sequential fresh consumption, nonce-wrapped jumper with odd-stride/`+1+(nonce&1)` anti-cycle guard + Weyl pointer + nonce-epoch drift, SFC32 sponge with hrtime jitter. Zero-allocation `nextUint32/nextFloat/nextGaussian`. |
-| `src/engine/SimulationCore.ts` | Structure-of-Arrays grid (one contiguous buffer, shareable), torus world, full tick pipeline, tools, inspector (kin-connected BFS), planar frame packing. |
-| `src/engine/Genome.ts` | 64-bit genome bit layout, phenotype decoding, kin recognition (Hamming ≤ 2 on 16-bit kin hash), quantum mutation. |
-| `src/engine/SimplexNoise.ts` | Quantum-seeded 2D simplex for drifting, tileable food pockets. |
-| `src/engine/protocol.ts` | Binary frame header, layers, params, JSON message types (shared by every runtime). |
-| `src/server/index.ts` | Fastify HTTP/WS, ANU cron, worker supervisor (auto-respawn), per-client delta sync and backpressure, rate limiting, COOP/COEP headers, static hosting. |
-| `src/server/simWorker.ts` | Authoritative tick loop (1x = 15 t/s, 5x = 75 t/s, Max vCPU = 14 ms time-sliced bursts), XOR-delta + deflate-raw frames compressed **once** for all clients. |
-| `src/client/sim/*` | `CloudSource` (WebSocket, in-order inflate and delta apply), `LocalSource` + `localWorker` (browser sandbox seeded from the server pool, transferable frame recycling), WebGL2 renderer with a Canvas2D fallback. |
-| `src/components/*` | `SimulationCanvas`, `QuantumEntropyHUD`, `ControlDrawer`, `OrganismInspector`, `TelemetryPanel`, `ActionBar`, `MobileLayout`. |
+| `src/client/morpho/` | The world: `MorphoGL.ts` (WebGL2 passes: occupancy, field convolutions, flow + phase update, stamps, stats, display), `regimes.ts`, `director.ts`, `drift.ts`, `settings.ts`, and the lab UI (`MorphoLab.tsx`, `SettingsPanel.tsx`). |
+| `src/client/Hosted.tsx` | The bare world the desktop app shows (`?view=wallpaper` / `?view=preview`), driven by messages from the app. |
+| `src/server/index.ts` | The website's server: static files, `/api/quantum/pool`, `/health`. |
+| `src/engine/` | The quantum-entropy harvester and QRNG providers used by the server. |
+| `desktop/TuringLife/` | The Windows app (C#, WinForms + WebView2): settings window, wallpaper window behind the icons (WorkerW), mouse relay, PC watcher, self-installer. |
+| `scripts/build-desktop.mjs` | Builds the web page, embeds it, and publishes the single self-contained `.exe`. |
+| `scripts/morpho-probe.ts` | CPU (FFT) version of the physics, for tuning regimes offline. |
 
-## Worlds
+## Deploy
 
-The server runs two universes side by side, each in its own worker thread and both fed by the same quantum pool. Switch between them with **Flat world / Deep space** in the app.
-
-* **Flat world (2D):** a 256×256 torus with a 4-neighbourhood.
-* **Deep space (3D):** a 64³ 3-torus with a 6-neighbourhood: colonies floating in a dark void, feeding on drifting quantum-seeded nutrient nebulae (3D simplex clouds). It is rendered by a WebGL2 raymarcher (`src/client/sim/renderer3d.ts`): DDA voxel traversal, the food field integrated as emissive fog, and cells shaded as bevelled cubes. In the Neural layer tissue turns translucent so signal waves show through whole bodies. Resolution adapts to hold the frame rate. Drag orbits, Shift-drag or two fingers pan, wheel or pinch zooms, a tap inspects, and with a tool the brush sits on the first cell under the pointer. `GRID_3D` sets the edge (16–128, 0 disables). Frames stream at ≤ 10/s, and a world nobody watches skips frame encoding. The local sandbox runs a 48³ version in the browser.
-
-## Physics in brief
-
-* **Cell state (SoA):** `somatic` (empty/core/armor/sensor), `energy`, `ambientFood`, `signalA` (nutrient), `signalB` (alarm), a 64-bit `genome` (2 × u32), a 2-bit `epigenetic` register (damaged/starving), plus terrain, flux and birth tick.
-* **Thermodynamics:** maintenance cost by tissue type (armor < core < sensor). Harvesting is 90% efficient. Division burns 0.06 energy, and emitting a signal costs 5% of that. Dead cells return body mass to the food field. Energy above 1.0 spills back into food instead of disappearing.
-* **Asynchrony:** each tick does a quantum Fisher–Yates shuffle of the live cells and gives every cell a Poisson phase clock (`p = 1 − e^(−λ)`).
-* **Nervous system:** signals move by relay waves through living tissue only, `signalSpeed` hops per tick (4× the 1-cell/tick growth speed by default).
-* **Metabolic routing:** Jacobi-style pairwise pumping between kin cells. It moves energy from high E to low E and toward alarm signals, conserves energy exactly, and caps outflow at 20% of the donor so no energy goes negative.
-* **Healing and foraging:** division targets are scored by food and signal gradients and by how many kin neighbours the target has, so wounds fill in. Alarm signals and damage memory push newborn cells toward armor. Cilia cells crawl up food gradients while staying attached to kin.
-* **Predation:** aggression drains energy from foreign neighbours. Armor resists. Damage sets the epigenetic bit, which children inherit.
-* **Food field (the green glow):** two quantum-seeded simplex noise fields drift slowly in different directions, forming nutrient pockets where food regrows logistically; 5% of the regrowth applies everywhere, so open space is lean but never barren. Pockets drift at a pace colonies can follow, which keeps populations stable (no boom-and-bust). Tunables live in `ECO` in `SimulationCore.ts`; measure changes with `npm run ecology`.
-* **Development (organisms vs. colonies):** every cell carries a third, 32-bit *developmental* genome word (layout in `Genome.ts`). With its developmental bit off, a lineage is an open-ended colony and behaves as above. With it on, the lineage makes bounded **organisms**: each grows from a single zygote, has its own body id, and shares energy only within that body.
-  * **Turing patterns:** inside each body an activator and an inhibitor react and diffuse (Gierer–Meinhardt with saturation, no flux across the body edge, inhibitor ≈ 8× faster). A quantum ±5 % jitter on each newborn's activator breaks the uniform state into spots, rings and stripes. The genome sets the gain and the inhibitor range.
-  * **Body axis and mirror rule:** a zygote gets a quantum-random axis that its cells inherit (or, in radial mode, an axis that follows each growth step). The body plan says which directions to grow (forward, back, sideways) when the activator is low or high. A sideways bud is paired with its mirror twin in the same act (two division costs, energy split three ways), so bodies grow bilaterally symmetric unless blocked. Growth follows the plan, not the local food, and stops at the genome's adult size (2–17 divisions from the zygote).
-  * **Cell-type rulebook:** the genome maps (activator high?, edge?) to core, armor or sensor (or the legacy random roll). Cells re-read it as the pattern settles; alarm still forces armor.
-  * **Seeds (single-cell bottleneck):** mature cells eject a one-cell seed 2–5 tiles past the tail, and the seed starts a new organism. It's paid for like a division and conserves energy. Body cells are clones; mutation happens only in seeds (3× the base rate), so the organism is the unit selection acts on.
-  * **Shape pays:** a core cell touching a sensor of its own body harvests 25 % more (sensor-guided feeding).
-  * Half the founder lineages start as organisms and half as colonies. `npm run morphology` reports organism counts, seeds, sizes and mirror symmetry, and draws the commonest body plans.
-* **Abiogenesis:** if the population collapses, a quantum event seeds new founder colonies.
-
-## Wire format
-
-Binary frames have a 16-byte header (`magic, kind, W, H, layers, flags, seq, tick`) followed by 8 planar W×H byte layers: state bits, energy, food, signal A, signal B, flux, lineage hue and ancestor distance. Keyframes and XOR deltas are deflate-raw compressed in the worker, and the browser inflates them with the native `DecompressionStream`. JSON telemetry is sent every 10 ticks (between 150 ms and 1 s apart).
-
-HTTP: `GET /health`, `GET /api/telemetry`, `GET /api/quantum/pool`, `POST /api/quantum/resync`, `GET /ws`.
-
-## Railway
-
-`railway.json` builds the `Dockerfile` (a multi-stage `node:22-bookworm-slim` image running as a non-root user) and health-checks `/health`. That endpoint reads the worker's heartbeat from shared memory and returns 503 if the heartbeat is more than 15 s old.
-
-| Env var | Default | |
-|---|---|---|
-| `PORT` | 8080 | set by Railway |
-| `SITE_PASSWORD` | — | password for the whole site (sim, WebSocket, API, Builder). Unset = open site, Builder off |
-| `SITE_SESSION_SECRET` | — | signs the unlock cookie; rotate it to sign everyone out |
-| `BUILDER_WORKER_TOKEN` | — | shared secret for the Builder worker on your PC |
-| `BUILDER_DAILY_USD` | 20 | Builder pauses new runs after this much estimated plan usage in 24 h |
-| `BUILDER_DATA_DIR` | volume `/builder` or `./data/builder` | where Builder requests are stored (needs a Railway volume to survive redeploys) |
-| `GRID_W` / `GRID_H` | 256 | 64–1024 |
-| `GRID_3D` | 64 | edge of the cubic 3D world, 16–128; `0` disables it |
-| `QRNG_PROVIDER` | `auto` | `lfdr` \| `qrngapi` \| `anu` \| `anu-legacy` \| `none`. `auto` = `lfdr`: the keyless [LfD QRNG](https://lfdr.de/QRNG/) at OTH Regensburg (ID Quantique Quantis PCIe), 2048 bytes = a full pool every 2 min. Keyed providers must be named explicitly |
-| `LFDR_URL` | `https://lfdr.de` | override the LfD base URL |
-| `QRNGAPI_KEY` | — | qrngapi.com key (`qnrk_…`), sent as `X-API-Key` |
-| `QRNGAPI_METHOD` | `auto` | hardware method to request (see `GET https://qrngapi.com/api/methods`) |
-| `ANU_API_KEY` | — | ANU Quantum Numbers key, sent as `x-api-key` |
-| `ANU_URL` | legacy `jsonI.php` | override the legacy endpoint |
-| `QRNG_ACCEPT_SIMULATOR` | `0` | `1` = ingest batches the provider labels `simulator`. They show as **SIMULATED**, never as quantum |
-| `QRNG_MONTHLY_REQUESTS` | provider free tier | qrngapi 10 (10 KB/month), ANU 100, legacy unmetered |
-| `QRNG_INTERVAL_MS` | budget ÷ month | defaults to spreading the budget evenly (qrngapi: 72 h, ANU: 7.2 h, legacy: 61 s) |
-
-Locally, put secrets in a git-ignored `.env` (see `.env.example`); the server loads it on start. On Railway, set them as service variables. `.env` is excluded from the Docker image.
-
-**How harvesting behaves:**
-- **Precheck:** before spending quota, the qrngapi provider calls the free `/api/methods` endpoint. It sends no entropy request while no hardware source is online, and re-checks every 6 h.
-- **Simulator batches:** batches whose `source` is `simulator` are rejected unless `QRNG_ACCEPT_SIMULATOR=1` is set.
-- **Partial batches:** a 1024-byte request yields 512 samples, so consecutive batches fill alternating halves of the pool.
-- **Budget:** the monthly budget counts manual resyncs too, and resets on the 1st of each month (UTC). It is held in memory, so a restart resets the counter. The provider's own quota responses still pause the harvester until next month.
-- **Rejected key:** a 401/403 halts harvesting for 6 h.
-
-## Builder
-
-Builder is a chat window inside the app (the speech-bubble button; `/builder` opens the app with it open) where you suggest changes or ask questions in plain words. A coding agent (Claude Code, on your own Claude plan) runs on your PC and works on them in a clone kept only for it (`~/turinglife-builder/repo`), on an `agent/<id>` branch. Ported from the DIY site's Builder.
-
-- **Questions** get an answer in the chat.
-- **Changes** are committed by the worker, which then runs `typecheck`, `selftest` and `build` (the agent gets one chance to fix failures) and screenshots the app from a local build. The proposal waits for you. **Approve** makes the worker push to `main`, and Railway redeploys. Follow-ups continue the same agent session.
-- The agent never sees the worker token, the Railway token or `.env`, and it can't push. Each request is capped at about $5 of usage and $20 a day (estimates of plan usage, not charges). A run is stopped after 30 minutes.
-
-To run the worker, add `BUILDER_URL` (the site's URL) and `BUILDER_WORKER_TOKEN` to `.env`, make sure Claude Code is signed in to your plan, then run:
-
-```
-npm run builder        # agent limited to an allow list (edit files, run checks, read git)
-npm run builder:full   # full PC access: any command, the web, Chrome. Pushing and .env stay blocked
-```
-
-Optional settings: `BUILDER_MODEL` (default `claude-opus-5-5`), `BUILDER_MAX_RUN_USD` (5), `BUILDER_RUN_MINUTES` (30), `BUILDER_HOME` and `BUILDER_CLAUDE_DIR` (a separate Claude login folder). The agent works from `docs/builder-guide.md`, so keep that guide current. `npm run ecology` is a headless population probe that the agent uses for tuning.
-
-## Controls
-
-Wheel or pinch zooms. Drag pans (with the Inspect tool, or right/middle drag). Double-click or double-tap fits the view. Keys `1`–`4` solo a layer, `Shift+1`–`4` blends layers. `Space` pauses. `I P M B X F K` pick tools, `[` `]` change brush size, `0` fits the view and `Esc` clears the selection.
+The repo deploys to Railway from `main` (Dockerfile; health check `/health`). Optional variables:
+`QRNG_PROVIDER` and friends (see `.env.example`).
